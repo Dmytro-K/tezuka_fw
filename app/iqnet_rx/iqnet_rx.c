@@ -42,7 +42,7 @@
 _Static_assert(sizeof(struct iqnet_hdr) == IQNET_HDR_LEN, "iqnet_hdr size");
 
 #define BATCH 64
-#define DGRAM_BUF 2048       /* > IQNET_HDR_LEN + IQNET_MAX_PAYLOAD; larger => MSG_TRUNC */
+#define DGRAM_BUF (IQNET_HDR_LEN + IQNET_MAX_PAYLOAD) /* jumbo (path=pl); larger => MSG_TRUNC */
 #define SEEN_BITS (1u << 16) /* duplicate-detection window, in datagrams */
 #define DUMP_BUF (4u << 20)
 
@@ -61,6 +61,8 @@ struct opts
     unsigned udp_port;
     unsigned ctrl_port;
     const char *mode;
+    const char *path; /* NULL = not sent (board default: kernel) */
+    long payload;     /* -1 = not sent */
     unsigned bytes_per_iq;
     int cs12;
     double seconds; /* 0 = until Ctrl+C */
@@ -77,6 +79,8 @@ static struct opts o = {
     .udp_port = 30432,
     .ctrl_port = IQNET_CTRL_PORT,
     .mode = "cs12",
+    .path = NULL,
+    .payload = -1,
     .bytes_per_iq = 3,
     .cs12 = 1,
     .seconds = 10,
@@ -153,11 +157,12 @@ static uint64_t dump_stream_base; /* file offset of stream offset 0 (moves on re
 static uint64_t stream_end;       /* highest stream offset + 1 of the current stream */
 
 /* board STATS reply, parsed tolerantly (key=value, unknown keys kept) */
-#define STATS_MAX 24
+#define STATS_MAX 32
 struct stats_kv
 {
     char key[32];
     uint64_t val;
+    char str[16]; /* non-numeric value (e.g. path=pl), "" for numbers */
 };
 static struct stats_kv board_stats[STATS_MAX];
 static unsigned board_stats_n;
@@ -601,7 +606,8 @@ static int ctrl_cmd(int fd, const char *cmd, char *reply, size_t sz, int timeout
 }
 
 /* "STATS key=value key=value ...": tolerant, unknown keys are kept, tokens
- * without '=' or with a non-numeric value are ignored. 0 = parsed. */
+ * without '=' are ignored, non-numeric values (path=pl) are kept as strings.
+ * 0 = parsed. */
 static int parse_stats(const char *line)
 {
     const char *p = line;
@@ -614,7 +620,8 @@ static int parse_stats(const char *line)
     for (;;)
     {
         const char *tok, *eq, *end;
-        size_t kl;
+        struct stats_kv *kv = NULL;
+        size_t kl, vl;
         char *e;
         uint64_t v;
 
@@ -630,31 +637,64 @@ static int parse_stats(const char *line)
         if (!eq || eq == tok || eq + 1 == end)
             continue;
         kl = (size_t)(eq - tok);
+        vl = (size_t)(end - eq - 1);
+        if (kl >= sizeof(kv->key) || board_stats_n == STATS_MAX)
+            continue;
+        kv = &board_stats[board_stats_n];
+        memset(kv, 0, sizeof(*kv));
         errno = 0;
         v = strtoull(eq + 1, &e, 10);
-        if (errno || e != end || kl >= sizeof(board_stats[0].key) || board_stats_n == STATS_MAX)
-            continue;
-        memcpy(board_stats[board_stats_n].key, tok, kl);
-        board_stats[board_stats_n].key[kl] = 0;
-        board_stats[board_stats_n].val = v;
+        if (errno || e != end || eq[1] < '0' || eq[1] > '9')
+        {
+            if (vl >= sizeof(kv->str))
+                continue;
+            memcpy(kv->str, eq + 1, vl);
+            kv->str[vl] = 0;
+        }
+        else
+        {
+            kv->val = v;
+        }
+        memcpy(kv->key, tok, kl);
+        kv->key[kl] = 0;
         board_stats_n++;
     }
     board_stats_ok = 1;
     return 0;
 }
 
-/* 1 = key present (value in *v) */
-static int stats_get(const char *key, uint64_t *v)
+static const struct stats_kv *stats_find(const char *key)
 {
     for (unsigned i = 0; i < board_stats_n; i++)
     {
         if (!strcmp(board_stats[i].key, key))
-        {
-            *v = board_stats[i].val;
-            return 1;
-        }
+            return &board_stats[i];
     }
-    return 0;
+    return NULL;
+}
+
+/* 1 = key present with a numeric value (value in *v) */
+static int stats_get(const char *key, uint64_t *v)
+{
+    const struct stats_kv *kv = stats_find(key);
+
+    if (!kv || kv->str[0])
+        return 0;
+    *v = kv->val;
+    return 1;
+}
+
+/* value of key as text ("n/a" when missing); buf holds numeric values */
+static const char *stats_str(const char *key, char *buf, size_t sz)
+{
+    const struct stats_kv *kv = stats_find(key);
+
+    if (!kv)
+        return "n/a";
+    if (kv->str[0])
+        return kv->str;
+    snprintf(buf, sz, "%" PRIu64, kv->val);
+    return buf;
 }
 
 static void print_stats(void)
@@ -669,13 +709,17 @@ static void print_stats(void)
         {"blocks", "IIO blocks sent and returned"},
         {"send_errors", "sendmsg failures (datagrams dropped)"},
         {"zc_copied", "zero-copy completions that copied"},
-        {"overflows", "DMA overflows (offset advanced 1 payload each)"},
+        {"overflows", "board-side overflows (seen as offset jumps)"},
         {"short_blocks", "short/aborted blocks dropped"},
         {"copy_batches", "batches sent in copy mode"},
         {"inflight", "blocks in flight"},
         {"running", "stream running"},
+        {"path", "streaming path (none | kernel | pl)"},
+        {"linux_frames", "pl: GEM frames from Linux passed through"},
+        {"linux_drops", "pl: GEM frames from Linux dropped (must be 0)"},
+        {"fifo_hwm", "pl: data FIFO high-water mark, bytes"},
     };
-    uint64_t v;
+    char nb[24];
     int first = 1;
 
     if (!board_stats_ok)
@@ -683,10 +727,9 @@ static void print_stats(void)
     printf("board stats:\n");
     for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++)
     {
-        if (stats_get(known[i].key, &v))
-            printf("  %-13s %-14" PRIu64 " %s\n", known[i].key, v, known[i].desc);
-        else
-            printf("  %-13s %-14s %s\n", known[i].key, "-", known[i].desc);
+        const char *val = stats_find(known[i].key) ? stats_str(known[i].key, nb, sizeof(nb)) : "-";
+
+        printf("  %-13s %-14s %s\n", known[i].key, val, known[i].desc);
     }
     for (unsigned i = 0; i < board_stats_n; i++)
     {
@@ -697,12 +740,36 @@ static void print_stats(void)
                 break;
         if (k < sizeof(known) / sizeof(known[0]))
             continue;
-        printf("%s%s=%" PRIu64, first ? "  other         " : " ", board_stats[i].key,
-               board_stats[i].val);
+        printf("%s%s=%s", first ? "  other         " : " ", board_stats[i].key,
+               stats_str(board_stats[i].key, nb, sizeof(nb)));
         first = 0;
     }
     if (!first)
         printf("\n");
+}
+
+/* -v: board-side loss as the board counted it next to the offset gaps seen here */
+static void print_loss_check(void)
+{
+    char b1[24], b2[24], b3[24], b4[24], b5[24];
+    uint64_t drops;
+
+    printf("loss check    receiver: %" PRIu64 " offset gaps, %" PRIu64 " B skipped\n",
+           c.board_gaps, c.board_lost);
+    if (!board_stats_ok)
+    {
+        printf("              board: no STATS reply\n");
+        return;
+    }
+    printf("              board: overflows=%s path=%s linux_frames=%s linux_drops=%s "
+           "fifo_hwm=%s\n",
+           stats_str("overflows", b1, sizeof(b1)), stats_str("path", b2, sizeof(b2)),
+           stats_str("linux_frames", b3, sizeof(b3)), stats_str("linux_drops", b4, sizeof(b4)),
+           stats_str("fifo_hwm", b5, sizeof(b5)));
+    if (stats_get("linux_drops", &drops) && drops)
+        printf("              WARNING: the PL streamer dropped %" PRIu64
+               " Linux frames (must be 0)\n",
+               drops);
 }
 
 static int ctrl_connect(const struct sockaddr_in *board)
@@ -923,18 +990,26 @@ static void usage(const char *argv0, FILE *f)
             "  -p, --port PORT        local UDP port to receive on (default 30432)\n"
             "  -P, --ctrl-port PORT   board TCP control port (default %u)\n"
             "  -m, --mode MODE        cs12 | cs8 | cs16 (default cs12)\n"
+            "  -T, --path PATH        board: kernel (iqnet.ko) | pl (PL streamer);\n"
+            "                         board default kernel\n"
+            "  -l, --payload BYTES    board: IQ bytes per datagram, multiple of %u,\n"
+            "                         %u..%u (kernel: <= %u; > %u needs MTU 9000)\n"
             "  -s, --seconds SEC      run time, 0 = until Ctrl+C (default 10)\n"
             "  -g, --gso SEGS         board: datagrams per sendmsg (UDP GSO), 0..%u\n"
             "  -b, --blocks N         board: number of IIO DMA blocks, 1..%u\n"
             "  -B, --block-size BYTES board: IIO block size (multiple of payload)\n"
+            "                         (-g/-b/-B apply to path=kernel only)\n"
             "  -o, --output FILE      dump raw IQ payload; file offset = stream offset,\n"
             "                         lost datagrams leave zero-filled (sparse) holes\n"
             "  -r, --rcvbuf MIB       requested SO_RCVBUF in MiB (default 128)\n"
-            "  -v, --verbose          log gaps, control traffic, etc.\n"
+            "  -v, --verbose          log gaps, control traffic, etc.; at the end compare\n"
+            "                         the board's overflows with the receiver's offset gaps\n"
             "  -h, --help             this help\n\n"
-            "Options -g/-b/-B are only sent in START when given (board defaults otherwise).\n"
+            "Options -T/-l/-g/-b/-B are only sent in START when given (board defaults\n"
+            "otherwise). The datagram size is taken from the board's OK reply.\n"
             "Ctrl+C stops cleanly (STATS + STOP); a second Ctrl+C exits immediately.\n",
-            argv0, IQNET_CTRL_PORT, IQNET_MAX_GSO, IQNET_MAX_BLOCKS);
+            argv0, IQNET_CTRL_PORT, IQNET_BURST, IQNET_BURST, IQNET_MAX_PAYLOAD, IQNET_STD_PAYLOAD,
+            IQNET_STD_PAYLOAD, IQNET_MAX_GSO, IQNET_MAX_BLOCKS);
 }
 
 static long parse_num(const char *s, const char *what, long min, long max)
@@ -959,6 +1034,8 @@ int main(int argc, char **argv)
         {"port", required_argument, 0, 'p'},
         {"ctrl-port", required_argument, 0, 'P'},
         {"mode", required_argument, 0, 'm'},
+        {"path", required_argument, 0, 'T'},
+        {"payload", required_argument, 0, 'l'},
         {"seconds", required_argument, 0, 's'},
         {"gso", required_argument, 0, 'g'},
         {"blocks", required_argument, 0, 'b'},
@@ -972,12 +1049,12 @@ int main(int argc, char **argv)
     struct sockaddr_in board = {0};
     struct addrinfo hints = {0}, *ai = NULL;
     struct sigaction sa = {0};
-    char cmd[256], line[512];
+    char cmd[256], line[sizeof(ctrl_rx)];
     int udp = -1, tcp = -1, ch, rc = 0, gai;
     double t0, t_end, next_rep, t_prev, t_stop;
     struct counters prev;
 
-    while ((ch = getopt_long(argc, argv, "H:p:P:m:s:g:b:B:o:r:vh", lopts, NULL)) != -1)
+    while ((ch = getopt_long(argc, argv, "H:p:P:m:T:l:s:g:b:B:o:r:vh", lopts, NULL)) != -1)
     {
         switch (ch)
         {
@@ -992,6 +1069,23 @@ int main(int argc, char **argv)
                 break;
             case 'm':
                 o.mode = optarg;
+                break;
+            case 'T':
+                if (strcmp(optarg, "kernel") && strcmp(optarg, "pl"))
+                {
+                    fprintf(stderr, "invalid path '%s' (kernel|pl)\n", optarg);
+                    return 2;
+                }
+                o.path = optarg;
+                break;
+            case 'l':
+                o.payload = parse_num(optarg, "payload", IQNET_BURST, IQNET_MAX_PAYLOAD);
+                if (o.payload % IQNET_BURST)
+                {
+                    fprintf(stderr, "invalid payload '%s' (must be a multiple of %u)\n", optarg,
+                            IQNET_BURST);
+                    return 2;
+                }
                 break;
             case 's': {
                 char *e;
@@ -1101,6 +1195,10 @@ int main(int argc, char **argv)
     {
         int l = snprintf(cmd, sizeof(cmd), "START %u %s", o.udp_port, o.mode);
 
+        if (o.path)
+            l += snprintf(cmd + l, sizeof(cmd) - (size_t)l, " path=%s", o.path);
+        if (o.payload >= 0)
+            l += snprintf(cmd + l, sizeof(cmd) - (size_t)l, " payload=%ld", o.payload);
         if (o.blocks >= 0)
             l += snprintf(cmd + l, sizeof(cmd) - (size_t)l, " blocks=%ld", o.blocks);
         if (o.block_size >= 0)
@@ -1119,8 +1217,9 @@ int main(int argc, char **argv)
     {
         unsigned pl = 0, bs = 0;
 
+        /* block_size 0: path=pl, no IIO blocks behind the datagrams */
         if (sscanf(line, "OK %u %u", &pl, &bs) != 2 || pl == 0 || pl % IQNET_BURST ||
-            pl > DGRAM_BUF - IQNET_HDR_LEN)
+            pl > IQNET_MAX_PAYLOAD)
         {
             fprintf(stderr, "START failed: %s\n", line);
             rc = 1;
@@ -1129,8 +1228,18 @@ int main(int argc, char **argv)
         payload_len = pl;
         block_size_reply = bs;
     }
-    printf("stream: mode %s, payload %u B/datagram, block %u B (%u datagrams/block), %u B/IQ\n",
-           o.mode, payload_len, block_size_reply, block_size_reply / payload_len, o.bytes_per_iq);
+    if (o.payload >= 0 && payload_len != (unsigned)o.payload)
+        printf("stream: board uses payload %u B, not the requested %ld B\n", payload_len,
+               o.payload);
+    if (block_size_reply)
+        printf("stream: path %s, mode %s, payload %u B/datagram, block %u B (%u datagrams/block), "
+               "%u B/IQ\n",
+               o.path ? o.path : "kernel", o.mode, payload_len, block_size_reply,
+               block_size_reply / payload_len, o.bytes_per_iq);
+    else
+        printf("stream: path %s, mode %s, payload %u B/datagram, no IIO blocks (PL streamer), "
+               "%u B/IQ\n",
+               o.path ? o.path : "pl", o.mode, payload_len, o.bytes_per_iq);
 
     /* 3. receive loop */
     t0 = now_s();
@@ -1262,6 +1371,8 @@ int main(int argc, char **argv)
                        " but no offset jump was received\n",
                        ovf, sb);
         }
+        if (o.verbose)
+            print_loss_check();
         if (c.lost > 0 || c.board_gaps || c.restarts || c.sync_counter_err || c.sync_period_err ||
             c.sync_missing || c.sync_phase_chg || c.bad_magic || c.bad_len || c.offset_err)
             rc = rc ? rc : 3;
