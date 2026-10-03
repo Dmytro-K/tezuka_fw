@@ -103,6 +103,10 @@
  *   iio_buffer_claim_blocks()            include/linux/iio/buffer_impl.h
  *   iio_buffer_release_blocks()          include/linux/iio/buffer_impl.h
  *   SKBFL_COHERENT_FRAGS                 include/linux/skbuff.h
+ *
+ * The PL streamer path (IQNET_IOC_PL_START) lives in iqnet_pl.c. This file
+ * owns the "one stream per board" decision for both paths: a stream of
+ * either path (or a kernel-path zombie) makes the other START -EBUSY.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -149,6 +153,7 @@
 #include <net/ip.h>
 #include <net/sock.h>
 
+#include "iqnet_pl.h"
 #include "iqnet_proto.h"
 #include "iqnet_uapi.h"
 
@@ -291,6 +296,11 @@ static void iqnet_reap_work(struct work_struct *work);
 static struct {
 	struct mutex lock;		/* serialises START/STOP/release/reap */
 	struct iqnet_stream *stream;	/* protected by lock */
+	/*
+	 * IQNET_PATH_* of the running or, once stopped, the last stream:
+	 * selects the counters STATS reports. Written under lock.
+	 */
+	u32 path;
 	/*
 	 * Serialises the stream's dequeue_block() and enqueue_block() calls
 	 * with the iqnet_stream::dma_queued update that goes with each, so
@@ -1470,7 +1480,7 @@ static long iqnet_ioctl_start(struct file *filp, void __user *argp)
 					    IQNET_ZOMBIE_WAIT);
 
 	mutex_lock(&iqnet.lock);
-	if (iqnet.stream || iqnet.zombie) {
+	if (iqnet.stream || iqnet.zombie || iqnet_pl_active()) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1492,6 +1502,7 @@ static long iqnet_ioctl_start(struct file *filp, void __user *argp)
 	atomic64_set(&iqnet.copy_batches, 0);
 	atomic_set(&iqnet.running, 1);
 	iqnet.stream = s;
+	WRITE_ONCE(iqnet.path, IQNET_PATH_KERNEL);
 
 	pr_info("started: dst=%pI4:%u src=%pI4 ifindex=%d payload=%u blocks=%ux%u batch=%u mode=%s%s cpu=%d sndbuf=%d\n",
 		&s->dst_addr, ntohs(s->dst_port), &s->src_addr, s->ifindex,
@@ -1508,6 +1519,42 @@ out:
 	return ret;
 }
 
+static long iqnet_ioctl_pl_start(struct file *filp, void __user *argp)
+{
+	struct iqnet_pl_start req;
+	long ret;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+
+	/* stock bitstream: no streamer, whatever else is going on */
+	if (!iqnet_pl_present())
+		return -ENODEV;
+
+	/* Give a zombie that is about to drain a moment to go away. */
+	if (READ_ONCE(iqnet.zombie))
+		wait_event_killable_timeout(iqnet.drain_wq,
+					    !READ_ONCE(iqnet.zombie),
+					    IQNET_ZOMBIE_WAIT);
+
+	mutex_lock(&iqnet.lock);
+	if (iqnet.stream || iqnet.zombie) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	/* validates @req, -EBUSY for a PL stream already running */
+	ret = iqnet_pl_start(&req, filp);
+	if (!ret)
+		WRITE_ONCE(iqnet.path, IQNET_PATH_PL);
+out:
+	mutex_unlock(&iqnet.lock);
+	return ret;
+}
+
 static long iqnet_ioctl_stop(void)
 {
 	long ret = 0;
@@ -1516,27 +1563,83 @@ static long iqnet_ioctl_stop(void)
 	if (iqnet.stream) {
 		ret = iqnet_stream_stop(iqnet.stream);
 		iqnet.stream = NULL;
+	} else {
+		ret = iqnet_pl_stop(NULL);
 	}
 	mutex_unlock(&iqnet.lock);
 	return ret;
 }
 
+/*
+ * Counters of the running or last stream. For the PL path they come from
+ * one streamer snapshot; the fields the streamer has no equivalent for
+ * stay 0. *@path is IQNET_PATH_NONE until the first START.
+ */
+static int iqnet_get_stats(struct iqnet_stats *st, u32 *path,
+			   struct iqnet_pl_counters *pl)
+{
+	bool running;
+	int ret;
+
+	memset(st, 0, sizeof(*st));
+	memset(pl, 0, sizeof(*pl));
+	*path = READ_ONCE(iqnet.path);
+
+	if (*path != IQNET_PATH_PL) {
+		st->datagrams = atomic64_read(&iqnet.datagrams);
+		st->bytes = atomic64_read(&iqnet.bytes);
+		st->blocks = atomic64_read(&iqnet.blocks);
+		st->send_errors = atomic64_read(&iqnet.send_errors);
+		st->zc_copied = atomic64_read(&iqnet.zc_copied);
+		st->overflows = atomic64_read(&iqnet.overflows);
+		st->short_blocks = atomic64_read(&iqnet.short_blocks);
+		st->copy_batches = atomic64_read(&iqnet.copy_batches);
+		st->blocks_inflight = atomic_read(&iqnet.inflight);
+		st->running = atomic_read(&iqnet.running);
+		return 0;
+	}
+
+	ret = iqnet_pl_read_counters(pl, &running);
+	if (ret)
+		return ret;
+	st->datagrams = pl->datagrams;
+	st->bytes = pl->bytes;
+	st->overflows = pl->overflows;
+	st->running = running;
+	return 0;
+}
+
 static long iqnet_ioctl_stats(void __user *argp)
 {
-	struct iqnet_stats st = {
-		.datagrams = atomic64_read(&iqnet.datagrams),
-		.bytes = atomic64_read(&iqnet.bytes),
-		.blocks = atomic64_read(&iqnet.blocks),
-		.send_errors = atomic64_read(&iqnet.send_errors),
-		.zc_copied = atomic64_read(&iqnet.zc_copied),
-		.overflows = atomic64_read(&iqnet.overflows),
-		.short_blocks = atomic64_read(&iqnet.short_blocks),
-		.copy_batches = atomic64_read(&iqnet.copy_batches),
-		.blocks_inflight = atomic_read(&iqnet.inflight),
-		.running = atomic_read(&iqnet.running),
-	};
+	struct iqnet_pl_counters pl;
+	struct iqnet_stats st;
+	u32 path;
+	int ret;
+
+	ret = iqnet_get_stats(&st, &path, &pl);
+	if (ret)
+		return ret;
 
 	return copy_to_user(argp, &st, sizeof(st)) ? -EFAULT : 0;
+}
+
+static long iqnet_ioctl_stats2(void __user *argp)
+{
+	struct iqnet_pl_counters pl;
+	struct iqnet_stats2 st2;
+	int ret;
+
+	memset(&st2, 0, sizeof(st2));
+	ret = iqnet_get_stats(&st2.base, &st2.path, &pl);
+	if (ret)
+		return ret;
+
+	st2.pl_present = iqnet_pl_present();
+	st2.linux_frames = pl.linux_frames;
+	st2.linux_drops = pl.linux_drops;
+	st2.fifo_hwm_bytes = pl.fifo_hwm_bytes;
+
+	return copy_to_user(argp, &st2, sizeof(st2)) ? -EFAULT : 0;
 }
 
 static long iqnet_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -1550,6 +1653,10 @@ static long iqnet_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return iqnet_ioctl_stop();
 	case IQNET_IOC_STATS:
 		return iqnet_ioctl_stats(argp);
+	case IQNET_IOC_PL_START:
+		return iqnet_ioctl_pl_start(filp, argp);
+	case IQNET_IOC_STATS2:
+		return iqnet_ioctl_stats2(argp);
 	default:
 		return -ENOTTY;
 	}
@@ -1563,6 +1670,8 @@ static int iqnet_release(struct inode *inode, struct file *filp)
 		iqnet_stream_stop(iqnet.stream);
 		iqnet.stream = NULL;
 	}
+	/* iqnetd died with a PL stream armed: disarm it */
+	iqnet_pl_stop(filp);
 	mutex_unlock(&iqnet.lock);
 	return 0;
 }
@@ -1597,13 +1706,22 @@ static int __init iqnet_init(void)
 	if (!iqnet.wq)
 		return -ENOMEM;
 
+	/* before /dev/iqnet appears, so PL_START sees the probe result */
+	ret = iqnet_pl_init();
+	if (ret)
+		goto err_wq;
+
 	ret = misc_register(&iqnet_misc);
-	if (ret) {
-		destroy_workqueue(iqnet.wq);
-		return ret;
-	}
+	if (ret)
+		goto err_pl;
 
 	return 0;
+
+err_pl:
+	iqnet_pl_exit();
+err_wq:
+	destroy_workqueue(iqnet.wq);
+	return ret;
 }
 
 static void __exit iqnet_exit(void)
@@ -1616,6 +1734,13 @@ static void __exit iqnet_exit(void)
 	 * -EBUSY instead of freeing memory the frags point at).
 	 */
 	WARN_ON(iqnet.stream || READ_ONCE(iqnet.zombie));
+
+	/*
+	 * A PL stream holds no module reference, but release() of its
+	 * /dev/iqnet file (which pins the module) already stopped it; the
+	 * driver's remove() disarms the streamer in any case.
+	 */
+	iqnet_pl_exit();
 
 	/*
 	 * A completion that queued the last work item may still be executing

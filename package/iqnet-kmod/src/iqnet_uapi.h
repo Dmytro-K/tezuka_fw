@@ -2,7 +2,7 @@
 /*
  * iqnet: zero-copy UDP streaming of IIO DMA blocks (ioctl interface).
  *
- * Shared by the kernel module (package/iqnet-kmod/src/iqnet.c) and the
+ * Shared by the kernel module (package/iqnet-kmod/src/iqnet_main.c, iqnet_pl.c) and the
  * control daemon (package/iqnetd/src/iqnetd.c). Keep both in sync.
  */
 #ifndef _UAPI_IQNET_H

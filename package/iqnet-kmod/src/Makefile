@@ -9,7 +9,10 @@
 
 ifneq ($(KERNELRELEASE),)
 
+# One module, iqnet.ko, from two objects. kbuild does not allow a composite
+# module to list an object of its own name, hence iqnet_main.c.
 obj-m := iqnet.o
+iqnet-y := iqnet_main.o iqnet_pl.o
 
 else
 
