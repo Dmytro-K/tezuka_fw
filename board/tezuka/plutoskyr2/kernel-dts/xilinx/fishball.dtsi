@@ -250,6 +250,18 @@
 			interrupt-parent = <&intc>;
 			interrupts = <0 55 IRQ_TYPE_LEVEL_HIGH>;
 		};
+
+		/*
+		 * PL UDP streamer, present only in the iqnet_top.bin bitstream.
+		 * The driver reads presence-gpios (EMIO 63) before touching reg:
+		 * with the stock bitstream the address is not decoded.
+		 */
+		iqnet_pl: iqnet-pl@43c10000 {
+			compatible = "plutosdr-learn,iqnet-pl-1.0";
+			reg = <0x43c10000 0x1000>;
+			presence-gpios = <&gpio0 117 GPIO_ACTIVE_HIGH>;
+			ethernet = <&gem0>;
+		};
 		
 		cf_ad9364_adc_core_0: cf-ad9361-lpc@79020000 {
 			compatible = "adi,axi-ad9361-6.00.a";
