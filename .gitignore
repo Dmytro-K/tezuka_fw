@@ -20,3 +20,4 @@ tezuka_fw.creator
 tezuka_fw.cxxflags
 tezuka_fw.files
 tezuka_fw.includes
+__pycache__/
