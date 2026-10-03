@@ -1,13 +1,18 @@
 #!/bin/sh
 ETH_IPADDR=$(fw_printenv -n ipaddr_eth 2> /dev/null)
+PIDFILE=/var/run/udhcpc.$1.pid
 
 case "$2" in
     up)
         if [ -z "$ETH_IPADDR" ] || [ "$ETH_IPADDR" = "dhcp" ]; then
-          /sbin/udhcpc -i "$1" -t 15 -T 4 -n -q -x hostname:"$(hostname)"
-        fi  
+            # one DHCP client per interface: ifup may already run one with this pidfile
+            [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && exit 0
+            # -b: keep retrying in background and renew the lease
+            /sbin/udhcpc -i "$1" -b -R -S -p "$PIDFILE" -x hostname:"$(hostname)"
+        fi
         ;;
     down)
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
         /sbin/ip addr flush dev "$1"
         ;;
 esac
