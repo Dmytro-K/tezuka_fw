@@ -61,6 +61,33 @@
                         reg = <0x6000000 0x10000000>;
                         label = "maia_sdr_recording";
                 };
+
+                /*
+                 * Default CMA pool (replaces CONFIG_CMA_SIZE_MBYTES=64,
+                 * which mm/cma.c places in HIGHMEM first on this
+                 * 1 GiB / VMSPLIT_3G / CONFIG_HIGHMEM kernel). Keep it in
+                 * LOWMEM (below ~0x2F800000). At boot the kernel linear
+                 * map of a lowmem CMA region is only split to page
+                 * granularity (dma_contiguous_remap(); it stays
+                 * cacheable). Then each dma_alloc_coherent() allocation
+                 * from it (IIO DMA blocks, sent zerocopy by iqnet) gets
+                 * its linear alias switched to uncached by __dma_remap(),
+                 * which is restored to cacheable on free. So while a
+                 * buffer is allocated, CPU paths that read its pages
+                 * through page_address() (skb_copy_ubufs(), software
+                 * checksum, ...) never see stale cache lines, unlike the
+                 * cached kmap() aliases of highmem pages. Allocated
+                 * anywhere below 0x28000000 outside the maia no-map
+                 * regions above. A "cma=" kernel argument overrides this
+                 * node.
+                 */
+                linux,cma {
+                        compatible = "shared-dma-pool";
+                        reusable;
+                        size = <0x4000000>;
+                        alloc-ranges = <0x0 0x28000000>;
+                        linux,cma-default;
+                };
         };
 
 	maia-sdr-recording {
