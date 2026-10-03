@@ -184,10 +184,10 @@
 #define IQNET_KNOWN_FLAGS	(IQNET_F_NO_ZEROCOPY | IQNET_F_SYNC_CACHE)
 
 static_assert(IQNET_MAX_GSO <= UDP_MAX_SEGMENTS);
-static_assert((size_t)IQNET_MAX_GSO * (IQNET_HDR_LEN + IQNET_MAX_PAYLOAD) <=
+static_assert((size_t)IQNET_MAX_GSO * (IQNET_HDR_LEN + IQNET_STD_PAYLOAD) <=
 	      IQNET_MAX_SEND_BYTES);
 static_assert(sizeof(struct iqnet_hdr) == IQNET_HDR_LEN);
-static_assert(IQNET_MAX_PAYLOAD < PAGE_SIZE); /* payload spans <= 2 pages */
+static_assert(IQNET_STD_PAYLOAD < PAGE_SIZE); /* payload spans <= 2 pages */
 static_assert(PAGE_SIZE % IQNET_HDR_LEN == 0); /* header never spans pages */
 
 static unsigned int cpu = 1;
@@ -1456,7 +1456,7 @@ static long iqnet_ioctl_start(struct file *filp, void __user *argp)
 	    (req.flags & ~IQNET_KNOWN_FLAGS))
 		return -EINVAL;
 	if (!req.payload_len || req.payload_len % IQNET_BURST ||
-	    req.payload_len > IQNET_MAX_PAYLOAD)
+	    req.payload_len > IQNET_STD_PAYLOAD)
 		return -EINVAL;
 	if (req.gso_segs > IQNET_MAX_GSO)
 		return -EINVAL;
