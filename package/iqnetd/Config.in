@@ -1,0 +1,14 @@
+config BR2_PACKAGE_IQNETD
+	bool "iqnetd"
+	depends on BR2_LINUX_KERNEL
+	select BR2_PACKAGE_IQNET_KMOD
+	help
+	  Control daemon for iqnet zero-copy UDP IQ streaming. Listens
+	  on TCP port 30433 (START/STOP/STATS, see
+	  package/iqnet-kmod/src/iqnet_proto.h), prepares the
+	  cf-ad9361-lpc IIO DMA buffer and hands it over to the iqnet
+	  kernel module, which sends the DMA blocks to the TCP peer
+	  over UDP without copying them.
+
+comment "iqnetd needs a Linux kernel to be built"
+	depends on !BR2_LINUX_KERNEL

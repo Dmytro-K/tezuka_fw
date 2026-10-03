@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# Starts iqnetd, the control daemon for iqnet zero-copy UDP IQ streaming
+# (TCP control port 30433). Loads the iqnet kernel module first; the
+# daemon only opens /dev/iqnet when a client sends START.
+
+NAME=iqnetd
+DAEMON=/usr/sbin/$NAME
+PIDFILE=/var/run/$NAME.pid
+# iqnetd's SIGTERM path runs IQNET_IOC_STOP, which waits up to 10 s
+# (IQNET_DRAIN_TIMEOUT) for in-flight skbs: wait longer than that.
+STOP_TIMEOUT=15
+
+[ -x "$DAEMON" ] || exit 0
+
+# any iqnetd, also one started by hand (matched by executable)
+running() {
+	start-stop-daemon -K -t -q -x "$DAEMON"
+}
+
+start() {
+	printf "Starting %s: " "$NAME"
+	if running; then
+		echo "FAIL (already running)"
+		return 1
+	fi
+	if ! modprobe iqnet 2>/dev/null; then
+		echo "FAIL (modprobe iqnet)"
+		return 1
+	fi
+	# -f: stay in foreground so start-stop-daemon -b/-m records the
+	# real pid; iqnetd logs to syslog.
+	if start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- -f; then
+		echo "OK"
+	else
+		echo "FAIL"
+		return 1
+	fi
+}
+
+stop() {
+	printf "Stopping %s: " "$NAME"
+	if ! running; then
+		rm -f "$PIDFILE"
+		echo "OK (not running)"
+		return 0
+	fi
+	# SIGTERM: iqnetd stops a running stream (IQNET_IOC_STOP waits for
+	# in-flight blocks) and releases the IIO buffer before exiting.
+	start-stop-daemon -K -q -x "$DAEMON"
+	i=0
+	while running && [ $i -lt $STOP_TIMEOUT ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	if running; then
+		# keep the pidfile: start refuses while it is still alive
+		echo "FAIL (still running after ${STOP_TIMEOUT}s, see dmesg)"
+		return 1
+	fi
+	rm -f "$PIDFILE"
+	echo "OK"
+}
+
+case "$1" in
+	start)
+		start;;
+	stop)
+		stop;;
+	restart|reload)
+		stop && start;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+esac
+
+exit $?

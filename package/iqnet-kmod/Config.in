@@ -1,0 +1,17 @@
+config BR2_PACKAGE_IQNET_KMOD
+	bool "iqnet kernel module"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Kernel module providing /dev/iqnet: streams IIO DMA blocks
+	  (cf-ad9361-lpc RX) as UDP datagrams with zero CPU copies.
+	  The IIO block pages are attached to skbs as frags and read
+	  directly by the GEM; blocks are returned to the DMA queue
+	  when transmission completes.
+
+	  Requires the tezuka kernel patches providing
+	  iio_buffer_get_from_file(), iio_buffer_claim_blocks(),
+	  iio_buffer_release_blocks() and SKBFL_COHERENT_FRAGS.
+	  Controlled by iqnetd.
+
+comment "iqnet kernel module needs a Linux kernel to be built"
+	depends on !BR2_LINUX_KERNEL
