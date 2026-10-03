@@ -9,8 +9,14 @@
  * module via IQNET_IOC_START (iqnet_uapi.h) and only then sets
  * buffer/enable=1, so the first DMA block already goes to the network. The
  * module streams the DMA blocks to <TCP peer>:<udp_port> without any CPU
- * copy, from the local address the control connection arrived on. STOP,
- * closing the TCP connection or SIGTERM tear the stream down again.
+ * copy, from the local address the control connection arrived on.
+ *
+ * START ... path=pl streams through the PL streamer instead: the buffer is
+ * prepared the same way but with a single small block (the DMA never fills
+ * it; enabling the buffer only makes the IIO driver enable the channels),
+ * IQNET_IOC_PL_START arms the streamer, then buffer/enable=1 starts it.
+ *
+ * STOP, closing the TCP connection or SIGTERM tear either stream down again.
  *
  * Usage: iqnetd [-f] [-p ctrl_port] [-F iqnet_flags]
  *   -f  stay in foreground (also log to stderr)
@@ -39,6 +45,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "iqnet_proto.h"
@@ -85,8 +92,14 @@ _Static_assert(sizeof(struct legacy_block) == 32, "iio_buffer_block ABI");
 
 #define MAX_BLOCK_SIZE (16u << 20) /* iio_dma_buffer_max_block_size default */
 
+/* path=pl: one block that only makes the IIO driver enable the channels */
+#define PL_BLOCK_SIZE 4096u
+/* IQNET_IOC_PL_START -EAGAIN (next-hop MAC not resolved yet): retries */
+#define PL_START_TRIES 10
+#define PL_START_RETRY_MS 100
+
 /* one UDP_SEGMENT super-datagram must fit the IPv4 total length limit */
-_Static_assert(IQNET_MAX_GSO *(IQNET_HDR_LEN + IQNET_DEFAULT_PAYLOAD) <= 65535 - 20 - 8,
+_Static_assert(IQNET_MAX_GSO *(IQNET_HDR_LEN + IQNET_STD_PAYLOAD) <= 65535 - 20 - 8,
                "IQNET_MAX_GSO too large for UDP GSO");
 
 #define LINE_MAX_LEN 256
@@ -109,6 +122,8 @@ struct start_req
 {
     unsigned int udp_port;
     const struct mode_desc *mode;
+    unsigned int path;    /* IQNET_PATH_KERNEL or IQNET_PATH_PL */
+    unsigned int payload; /* IQ bytes per datagram */
     unsigned int blocks;
     unsigned int block_size;
     unsigned int gso;
@@ -116,7 +131,7 @@ struct start_req
 
 struct stream
 {
-    int active; /* IQNET_IOC_START succeeded */
+    int active; /* IQNET_IOC_START or IQNET_IOC_PL_START succeeded */
     int iio_fd;
     int iqnet_fd;
     int buf_enabled;  /* we wrote buffer/enable=1 */
@@ -308,6 +323,27 @@ static int xioctl(int fd, unsigned long req, void *arg)
     return ret;
 }
 
+static void sleep_ms(unsigned int ms)
+{
+    struct timespec ts = {.tv_sec = ms / 1000u, .tv_nsec = (long)(ms % 1000u) * 1000000L};
+
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+        ;
+}
+
+static const char *path_name(unsigned int path)
+{
+    switch (path)
+    {
+        case IQNET_PATH_KERNEL:
+            return "kernel";
+        case IQNET_PATH_PL:
+            return "pl";
+        default:
+            return "none";
+    }
+}
+
 /*
  * Error text for a failed IIO block ioctl. EBUSY means the blocks of the
  * buffer are claimed (iio_buffer_claim_blocks(): an iqnet stream owns
@@ -328,8 +364,10 @@ static void block_ioctl_err(const struct stream *s, const char *what, int e, cha
 
 /*
  * Tear down whatever stream_start() set up. Safe on a partial setup.
- * IQNET_IOC_STOP comes first: until it returns the module owns the blocks
- * and buffer/enable must not be touched (iqnet_uapi.h).
+ * IQNET_IOC_STOP comes first for both paths: until it returns the module
+ * owns (claims) the blocks and buffer/enable must not be touched
+ * (iqnet_uapi.h). For path=pl it returns once the streamer is disarmed;
+ * buffer/enable=0 then stops the channels and the single block is freed.
  *
  * Returns 0, or -errno if IQNET_IOC_STOP failed. -ETIMEDOUT means the
  * in-flight skbs did not drain in time (IQNET_DRAIN_TIMEOUT): the module
@@ -344,7 +382,8 @@ static int stream_stop(struct stream *s)
 
     if (s->active)
     {
-        syslog(LOG_INFO, "stopping stream to %s:%u", inet_ntoa(s->dst), s->req.udp_port);
+        syslog(LOG_INFO, "stopping %s stream to %s:%u", path_name(s->req.path), inet_ntoa(s->dst),
+               s->req.udp_port);
         /* blocks until every in-flight block is back in IIO */
         if (xioctl(s->iqnet_fd, IQNET_IOC_STOP, NULL) < 0)
         {
@@ -385,7 +424,12 @@ static int stream_stop(struct stream *s)
     return stop_err;
 }
 
-static int stream_stats(const struct stream *s, struct iqnet_stats *st, char *err, size_t errlen)
+/*
+ * IQNET_IOC_STATS2, or IQNET_IOC_STATS on an older module that has no
+ * STATS2 (ENOTTY/EINVAL): then path is IQNET_PATH_NONE and the PL fields
+ * are zero.
+ */
+static int stream_stats(const struct stream *s, struct iqnet_stats2 *st, char *err, size_t errlen)
 {
     int fd = s->iqnet_fd, ret = 0;
 
@@ -400,10 +444,22 @@ static int stream_stats(const struct stream *s, struct iqnet_stats *st, char *er
         }
     }
     memset(st, 0, sizeof(*st));
-    if (xioctl(fd, IQNET_IOC_STATS, st) < 0)
+    if (xioctl(fd, IQNET_IOC_STATS2, st) < 0)
     {
-        snprintf(err, errlen, "IQNET_IOC_STATS: %s", strerror(errno));
-        ret = -1;
+        int e = errno;
+
+        memset(st, 0, sizeof(*st));
+        if (e != ENOTTY && e != EINVAL)
+        {
+            snprintf(err, errlen, "IQNET_IOC_STATS2: %s", strerror(e));
+            ret = -1;
+        }
+        else if (xioctl(fd, IQNET_IOC_STATS, &st->base) < 0)
+        {
+            snprintf(err, errlen, "IQNET_IOC_STATS: %s", strerror(errno));
+            ret = -1;
+        }
+        st->path = IQNET_PATH_NONE;
     }
     if (fd != s->iqnet_fd)
         close(fd);
@@ -418,20 +474,119 @@ static int stream_stats(const struct stream *s, struct iqnet_stats *st, char *er
 static int iqnet_draining(void)
 {
     struct stream tmp;
-    struct iqnet_stats st;
+    struct iqnet_stats2 st;
     char err[ERR_LEN];
 
     stream_init(&tmp);
     if (stream_stats(&tmp, &st, err, sizeof(err)))
         return 0;
-    return !st.running && st.blocks_inflight > 0;
+    return !st.base.running && st.base.blocks_inflight > 0;
+}
+
+/* error text for EBUSY from IQNET_IOC_START / IQNET_IOC_PL_START */
+static void iqnet_busy_err(const struct stream *s, char *err, size_t errlen)
+{
+    struct iqnet_stats sst;
+
+    memset(&sst, 0, sizeof(sst));
+    if (xioctl(s->iqnet_fd, IQNET_IOC_STATS, &sst) == 0 && sst.running)
+        snprintf(err, errlen, "busy: iqnet module already streaming (another iqnetd/client?)");
+    else if (sst.blocks_inflight > 0)
+        snprintf(err, errlen, "busy: previous iqnet stream still draining (see dmesg)");
+    else
+        snprintf(err, errlen,
+                 "busy: IIO blocks of %s are already claimed (iiod/libiio client or stale "
+                 "iqnet user?)",
+                 s->devnode);
+}
+
+static int stream_kernel_start(struct stream *s, char *err, size_t errlen)
+{
+    const struct start_req *rq = &s->req;
+    struct iqnet_start st;
+
+    memset(&st, 0, sizeof(st));
+    st.buffer_fd = s->iio_fd;
+    st.dst_addr = s->dst.s_addr;
+    st.dst_port = htons((uint16_t)rq->udp_port);
+    st.payload_len = (uint16_t)rq->payload;
+    st.gso_segs = rq->gso;
+    st.flags = g_iqnet_flags;
+    st.src_addr = s->src.s_addr;
+    /* st.reserved[] stays zero (memset) */
+    if (xioctl(s->iqnet_fd, IQNET_IOC_START, &st) < 0)
+    {
+        int e = errno;
+
+        if (e == EBUSY)
+            iqnet_busy_err(s, err, errlen);
+        else if (e == EADDRNOTAVAIL)
+            snprintf(err, errlen, "IQNET_IOC_START: source address %s not usable: %s",
+                     inet_ntoa(s->src), strerror(e));
+        else
+            snprintf(err, errlen, "IQNET_IOC_START: %s", strerror(e));
+        return -1;
+    }
+    return 0;
+}
+
+static int stream_pl_start(struct stream *s, char *err, size_t errlen)
+{
+    const struct start_req *rq = &s->req;
+    struct iqnet_pl_start st;
+    char da[INET_ADDRSTRLEN];
+    unsigned int tries;
+    int e;
+
+    inet_ntop(AF_INET, &s->dst, da, sizeof(da));
+    memset(&st, 0, sizeof(st));
+    st.buffer_fd = s->iio_fd;
+    st.dst_addr = s->dst.s_addr;
+    st.dst_port = htons((uint16_t)rq->udp_port);
+    st.payload_len = (uint16_t)rq->payload;
+    /* st.flags and st.reserved[] stay zero (memset) */
+    for (tries = 1;; tries++)
+    {
+        if (xioctl(s->iqnet_fd, IQNET_IOC_PL_START, &st) == 0)
+            return 0;
+        e = errno;
+        if (e != EAGAIN || tries >= PL_START_TRIES)
+            break;
+        /* the module started a neighbour probe for the next hop */
+        sleep_ms(PL_START_RETRY_MS);
+    }
+
+    switch (e)
+    {
+        case EAGAIN:
+            snprintf(err, errlen, "cannot resolve MAC of %s", da);
+            break;
+        case ENODEV:
+            snprintf(err, errlen, "no PL streamer in the loaded bitstream");
+            break;
+        case ENETDOWN:
+            snprintf(err, errlen, "link is not 1000/full");
+            break;
+        case ENETUNREACH:
+            snprintf(err, errlen, "route to %s is not via the PL-attached interface", da);
+            break;
+        case EBUSY:
+            iqnet_busy_err(s, err, errlen);
+            break;
+        case ENOTTY:
+            snprintf(err, errlen, "iqnet module without IQNET_IOC_PL_START (too old?)");
+            break;
+        default:
+            snprintf(err, errlen, "IQNET_IOC_PL_START: %s", strerror(e));
+            break;
+    }
+    return -1;
 }
 
 static int stream_start(struct stream *s, const struct start_req *rq, struct in_addr dst,
                         struct in_addr src, char *err, size_t errlen)
 {
     struct legacy_block_alloc_req areq;
-    struct iqnet_start st;
     char path[200];
     char val[64];
     unsigned int i;
@@ -553,40 +708,18 @@ static int stream_start(struct stream *s, const struct start_req *rq, struct in_
         goto fail;
     }
 
-    memset(&st, 0, sizeof(st));
-    st.buffer_fd = s->iio_fd;
-    st.dst_addr = dst.s_addr;
-    st.dst_port = htons((uint16_t)rq->udp_port);
-    st.payload_len = IQNET_DEFAULT_PAYLOAD;
-    st.gso_segs = rq->gso;
-    st.flags = g_iqnet_flags;
-    st.src_addr = src.s_addr;
-    /* st.reserved[] stays zero (memset) */
-    if (xioctl(s->iqnet_fd, IQNET_IOC_START, &st) < 0)
-    {
-        int e = errno;
-        struct iqnet_stats sst;
-
-        memset(&sst, 0, sizeof(sst));
-        if (e == EBUSY && xioctl(s->iqnet_fd, IQNET_IOC_STATS, &sst) == 0 && sst.running)
-            snprintf(err, errlen, "busy: iqnet module already streaming (another iqnetd/client?)");
-        else if (e == EBUSY && sst.blocks_inflight > 0)
-            snprintf(err, errlen, "busy: previous iqnet stream still draining (see dmesg)");
-        else if (e == EBUSY)
-            snprintf(err, errlen,
-                     "busy: IIO blocks of %s are already claimed (iiod/libiio client or stale "
-                     "iqnet user?)",
-                     s->devnode);
-        else if (e == EADDRNOTAVAIL)
-            snprintf(err, errlen, "IQNET_IOC_START: source address %s not usable: %s",
-                     inet_ntoa(src), strerror(e));
-        else
-            snprintf(err, errlen, "IQNET_IOC_START: %s", strerror(e));
+    if (rq->path == IQNET_PATH_PL)
+        ret = stream_pl_start(s, err, errlen);
+    else
+        ret = stream_kernel_start(s, err, errlen);
+    if (ret)
         goto fail;
-    }
     s->active = 1;
 
-    /* enable only now: no DMA block completes before the module owns them */
+    /*
+     * Enable only now: no DMA block completes before the module owns them,
+     * and the PL streamer is armed before the first word of a CS12 burst.
+     */
     ret = devattr_write(s, "buffer/enable", "1");
     if (ret)
     {
@@ -600,11 +733,15 @@ static int stream_start(struct stream *s, const struct start_req *rq, struct in_
 
         inet_ntop(AF_INET, &src, sa, sizeof(sa));
         inet_ntop(AF_INET, &dst, da, sizeof(da));
-        syslog(
-            LOG_INFO,
-            "streaming %s from %s, %s -> %s:%u: %u blocks x %u B, payload %u, gso %u, flags 0x%x",
-            rq->mode->name, s->devnode, sa, da, rq->udp_port, rq->blocks, rq->block_size,
-            IQNET_DEFAULT_PAYLOAD, rq->gso, g_iqnet_flags);
+        if (rq->path == IQNET_PATH_PL)
+            syslog(LOG_INFO, "streaming %s from %s via the PL streamer -> %s:%u: payload %u",
+                   rq->mode->name, s->devnode, da, rq->udp_port, rq->payload);
+        else
+            syslog(LOG_INFO,
+                   "streaming %s from %s, %s -> %s:%u: %u blocks x %u B, payload %u, gso %u, "
+                   "flags 0x%x",
+                   rq->mode->name, s->devnode, sa, da, rq->udp_port, rq->blocks, rq->block_size,
+                   rq->payload, rq->gso, g_iqnet_flags);
     }
     return 0;
 
@@ -667,13 +804,21 @@ static int parse_uint(const char *str, unsigned int min, unsigned int max, unsig
     return 0;
 }
 
-/* START <udp_port> <mode> [blocks=] [block_size=] [gso=] */
+/*
+ * START <udp_port> <mode> [path=kernel|pl] [payload=] [blocks=] [block_size=] [gso=]
+ * blocks/block_size/gso are kernel-path options; path=pl uses one
+ * PL_BLOCK_SIZE block that is never filled.
+ */
 static int parse_start(char *args, struct start_req *rq, char *err, size_t errlen)
 {
+    const char *kernel_opt = NULL; /* first kernel-only option given */
     char *save = NULL, *tok;
-    unsigned int i;
+    int block_size_set = 0;
+    unsigned int i, payload_max;
 
     memset(rq, 0, sizeof(*rq));
+    rq->path = IQNET_PATH_KERNEL;
+    rq->payload = IQNET_DEFAULT_PAYLOAD;
     rq->blocks = IQNET_DEFAULT_BLOCKS;
     rq->block_size = IQNET_DEFAULT_BLOCK_SIZE;
     rq->gso = 0;
@@ -711,13 +856,36 @@ static int parse_start(char *args, struct start_req *rq, char *err, size_t errle
         }
         *eq = '\0';
         val = eq + 1;
-        if (strcmp(key, "blocks") == 0)
+        if (strcmp(key, "path") == 0)
+        {
+            if (strcasecmp(val, "kernel") == 0)
+                rq->path = IQNET_PATH_KERNEL;
+            else if (strcasecmp(val, "pl") == 0)
+                rq->path = IQNET_PATH_PL;
+            else
+            {
+                snprintf(err, errlen, "bad path '%.32s' (kernel|pl)", val);
+                return -1;
+            }
+        }
+        else if (strcmp(key, "payload") == 0)
+        {
+            /* range and multiple of IQNET_BURST are checked once the path is known */
+            if (parse_uint(val, 1, IQNET_MAX_PAYLOAD, &rq->payload))
+            {
+                snprintf(err, errlen, "bad payload");
+                return -1;
+            }
+        }
+        else if (strcmp(key, "blocks") == 0)
         {
             if (parse_uint(val, 1, IQNET_MAX_BLOCKS, &rq->blocks))
             {
                 snprintf(err, errlen, "bad blocks (1..%u)", IQNET_MAX_BLOCKS);
                 return -1;
             }
+            if (!kernel_opt)
+                kernel_opt = key;
         }
         else if (strcmp(key, "block_size") == 0)
         {
@@ -726,6 +894,9 @@ static int parse_start(char *args, struct start_req *rq, char *err, size_t errle
                 snprintf(err, errlen, "bad block_size (1..%u)", MAX_BLOCK_SIZE);
                 return -1;
             }
+            block_size_set = 1;
+            if (!kernel_opt)
+                kernel_opt = key;
         }
         else if (strcmp(key, "gso") == 0)
         {
@@ -734,6 +905,8 @@ static int parse_start(char *args, struct start_req *rq, char *err, size_t errle
                 snprintf(err, errlen, "bad gso (0..%u)", IQNET_MAX_GSO);
                 return -1;
             }
+            if (!kernel_opt)
+                kernel_opt = key;
         }
         else
         {
@@ -742,10 +915,33 @@ static int parse_start(char *args, struct start_req *rq, char *err, size_t errle
         }
     }
 
-    if (rq->block_size % IQNET_DEFAULT_PAYLOAD)
+    payload_max = rq->path == IQNET_PATH_PL ? IQNET_MAX_PAYLOAD : IQNET_STD_PAYLOAD;
+    if (rq->payload < IQNET_BURST || rq->payload > payload_max || rq->payload % IQNET_BURST)
+    {
+        snprintf(err, errlen, "bad payload");
+        return -1;
+    }
+
+    if (rq->path == IQNET_PATH_PL)
+    {
+        if (kernel_opt)
+        {
+            snprintf(err, errlen, "%s= is not allowed with path=pl", kernel_opt);
+            return -1;
+        }
+        rq->blocks = 1;
+        rq->block_size = PL_BLOCK_SIZE;
+        rq->gso = 0;
+        return 0;
+    }
+
+    /* keep the default block size a whole number of datagrams */
+    if (!block_size_set)
+        rq->block_size = IQNET_DEFAULT_BLOCK_SIZE / rq->payload * rq->payload;
+    if (rq->block_size % rq->payload)
     {
         snprintf(err, errlen, "block_size %u is not a multiple of payload_len %u", rq->block_size,
-                 IQNET_DEFAULT_PAYLOAD);
+                 rq->payload);
         return -1;
     }
     if (rq->block_size % rq->mode->bytes_per_datum)
@@ -780,7 +976,7 @@ static void handle_line(int cfd, char *line, struct stream *s, struct in_addr pe
 
         if (s->active)
         {
-            reply(cfd, "ERR already running (send STOP first)");
+            reply(cfd, "ERR busy: already running (send STOP first)");
             return;
         }
         if (parse_start(args, &rq, err, sizeof(err)))
@@ -800,7 +996,8 @@ static void handle_line(int cfd, char *line, struct stream *s, struct in_addr pe
             reply(cfd, "ERR %s", err);
             return;
         }
-        reply(cfd, "OK %u %u", IQNET_DEFAULT_PAYLOAD, rq.block_size);
+        /* path=pl has no DMA blocks the host could size its buffers by */
+        reply(cfd, "OK %u %u", rq.payload, rq.path == IQNET_PATH_PL ? 0u : rq.block_size);
     }
     else if (strcasecmp(cmd, "STOP") == 0)
     {
@@ -816,21 +1013,35 @@ static void handle_line(int cfd, char *line, struct stream *s, struct in_addr pe
     }
     else if (strcasecmp(cmd, "STATS") == 0)
     {
-        struct iqnet_stats st;
+        struct iqnet_stats2 st2;
+        struct iqnet_stats *st = &st2.base;
 
-        if (stream_stats(s, &st, err, sizeof(err)))
+        if (stream_stats(s, &st2, err, sizeof(err)))
         {
             reply(cfd, "ERR %s", err);
             return;
         }
+        if (st2.path == IQNET_PATH_PL)
+        {
+            /* kernel-path counters do not apply to the PL streamer */
+            st->blocks = 0;
+            st->send_errors = 0;
+            st->zc_copied = 0;
+            st->short_blocks = 0;
+            st->copy_batches = 0;
+            st->blocks_inflight = 0;
+        }
         reply(cfd,
               "STATS datagrams=%llu bytes=%llu blocks=%llu send_errors=%llu zc_copied=%llu "
-              "overflows=%llu short_blocks=%llu copy_batches=%llu inflight=%u running=%u",
-              (unsigned long long)st.datagrams, (unsigned long long)st.bytes,
-              (unsigned long long)st.blocks, (unsigned long long)st.send_errors,
-              (unsigned long long)st.zc_copied, (unsigned long long)st.overflows,
-              (unsigned long long)st.short_blocks, (unsigned long long)st.copy_batches,
-              (unsigned int)st.blocks_inflight, st.running ? 1u : 0u);
+              "overflows=%llu short_blocks=%llu copy_batches=%llu inflight=%u running=%u "
+              "path=%s linux_frames=%llu linux_drops=%llu fifo_hwm=%llu",
+              (unsigned long long)st->datagrams, (unsigned long long)st->bytes,
+              (unsigned long long)st->blocks, (unsigned long long)st->send_errors,
+              (unsigned long long)st->zc_copied, (unsigned long long)st->overflows,
+              (unsigned long long)st->short_blocks, (unsigned long long)st->copy_batches,
+              (unsigned int)st->blocks_inflight, st->running ? 1u : 0u, path_name(st2.path),
+              (unsigned long long)st2.linux_frames, (unsigned long long)st2.linux_drops,
+              (unsigned long long)st2.fifo_hwm_bytes);
     }
     else
     {
