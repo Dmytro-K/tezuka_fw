@@ -256,9 +256,9 @@
 		 * The driver reads presence-gpios (EMIO 63) before touching reg:
 		 * with the stock bitstream the address is not decoded.
 		 */
-		iqnet_pl: iqnet-pl@43c10000 {
+		iqnet_pl: iqnet-pl@43c20000 {
 			compatible = "plutosdr-learn,iqnet-pl-1.0";
-			reg = <0x43c10000 0x1000>;
+			reg = <0x43c20000 0x1000>;
 			presence-gpios = <&gpio0 117 GPIO_ACTIVE_HIGH>;
 			ethernet = <&gem0>;
 		};
