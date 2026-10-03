@@ -165,3 +165,7 @@ BR2_PACKAGE_DATV=y
 # the mosquitto.conf websocket listeners the dashboard depends on.
 # See plutoplus_maiasdr_defconfig / commit b7b03a3 for the original fix.
 BR2_PACKAGE_MOSQUITTO_WS_LIBWS=y
+
+BR2_PACKAGE_LINUX_TOOLS_PERF=y
+BR2_PACKAGE_IPERF3=y
+BR2_PACKAGE_STRACE=y
