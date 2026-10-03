@@ -1,0 +1,288 @@
+From: Dmytro-K <dimattt92@googlemail.com>
+Subject: [PATCH] net: macb: free pending TX skbs on close and link change
+
+The driver never released frames still between tx_tail and tx_head (queued
+or sent but not yet reaped):
+- macb_close() -> macb_free_consistent() just kfree()d queue->tx_skb,
+- macb_mac_link_up() just zeroed tx_head/tx_tail.
+
+Besides leaking the skbs and their DMA mappings, this keeps the owning
+socket's send buffer charged and never completes zerocopy ubuf_infos
+(MSG_ZEROCOPY notifications, in-kernel zerocopy senders such as iqnet
+waiting for their buffers back).
+
+Add macb_tx_drop_pending(): unmap/free every pending entry with
+macb_tx_unmap(bp, macb_tx_skb(queue, tail), 0), account them as
+tx_dropped and reset tx_head/tx_tail. Call it:
+- from macb_free_consistent() before the tx_skb array is freed, like
+  mainline commit 27f575836cfe ("net: macb: drop in-flight Tx SKBs on
+  close"); NAPI is disabled and the controller reset there. It runs with
+  BHs disabled, so the skbs (IRQs on, budget 0: consume_skb()) and with
+  them the zerocopy completions and frag page unrefs are released inside
+  an RCU (BH) read-side section that a sender's synchronize_net() waits
+  for, as for completions from the TX softirq;
+- from macb_mac_link_down() (macb_tx_drop_all_pending()), under
+  tx_ptr_lock (vs. macb_start_xmit()/macb_tx_complete()) with bp->lock
+  nested inside it in macb_start_xmit()'s order (vs.
+  macb_tx_error_task(), which walks the ring under bp->lock only);
+- from macb_mac_link_up() instead of the bare tx_head/tx_tail reset, as a
+  safety net for anything queued while the link was down, before bp->lock
+  is taken.
+
+Link down must leave nothing that can add to the ring until link up:
+- macb_mac_link_down() stops the queues with netif_tx_disable() instead
+  of netif_tx_stop_all_queues(): it takes each queue's xmit lock, so no
+  macb_start_xmit() is still running when the ring is dropped;
+- macb_tx_complete() only wakes its stopped queue while TE is set (NCR
+  read under tx_ptr_lock), and macb_tx_error_task() only restarts the
+  queues while TE is set (under bp->lock). macb_mac_link_down() clears
+  TE under bp->lock (like every other NCR read-modify-write, so a
+  concurrent TSTART write-back cannot set TE again), reads NCR back,
+  then takes both locks once (a first
+  macb_tx_drop_all_pending()) to wait for a TX poll or error task that
+  still saw TE set, then netif_tx_disable(), then drops the ring again
+  for frames an xmit still in progress may have added. So a racing NAPI
+  TX poll can no longer reopen a queue during link down (the qdisc is
+  only deactivated later, from linkwatch).
+
+Clearing TE resets the controller's TX queue pointer to TBQP (ring index
+0), so frames left in the ring at link down could not be sent from where
+they are. Mainline instead keeps them across a link flap and rotates the
+ring at link up (commit 881a0263d502 ("net: macb: Shuffle the tx ring
+before enabling tx")); here they are dropped at link down so their
+resources and zerocopy completions are released immediately rather than
+after an unbounded link-down period, and stale real-time data is not sent
+late. At link down IRQs are disabled under the locks, so the skbs go
+through dev_consume_skb_any() to the NET_TX softirq and complete shortly
+after.
+
+macb_close() ordering is unchanged and consistent with this: the core
+has deactivated the qdisc and waited for xmits before ndo_stop;
+netif_tx_stop_all_queues() and napi_disable() come before phylink_stop()
+(-> macb_mac_link_down() if the link was up), and macb_free_consistent()
+runs after the controller reset. In macb_open() the queues are started
+before the first link up, but with the carrier off the qdisc is not
+active until phylink's link up, which drops the (empty) ring, sets TE and
+wakes them.
+
+This tree has no BQL in macb (no netdev_tx_sent_queue()), so there is no
+netdev_tx_reset_queue() to add.
+---
+ drivers/net/ethernet/cadence/macb_main.c | 143 ++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 134 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -746,12 +746,15 @@
+ 	spin_unlock_irqrestore(&bp->lock, flags);
+ }
+ 
++static void macb_tx_drop_all_pending(struct macb *bp);
++
+ static void macb_mac_link_down(struct phylink_config *config, unsigned int mode,
+ 			       phy_interface_t interface)
+ {
+ 	struct net_device *ndev = to_net_dev(config->dev);
+ 	struct macb *bp = netdev_priv(ndev);
+ 	struct macb_queue *queue;
++	unsigned long flags;
+ 	unsigned int q;
+ 	u32 ctrl;
+ 
+@@ -760,11 +763,44 @@
+ 			queue_writel(queue, IDR,
+ 				     bp->rx_intr_mask | MACB_TX_INT_FLAGS | MACB_BIT(HRESP));
+ 
+-	/* Disable Rx and Tx */
++	/* Disable Rx and Tx. The NCR read-modify-write is done under
++	 * bp->lock like every other one (macb_start_xmit() sets TSTART
++	 * under it): otherwise a concurrent TSTART write-back could set TE
++	 * again and defeat the TE-gated queue wake below. The read back
++	 * makes sure the TE clear has reached the controller before another
++	 * CPU's macb_tx_complete()/macb_tx_error_task() reads NCR after
++	 * taking the locks in macb_tx_drop_all_pending().
++	 */
++	spin_lock_irqsave(&bp->lock, flags);
+ 	ctrl = macb_readl(bp, NCR) & ~(MACB_BIT(RE) | MACB_BIT(TE));
+ 	macb_writel(bp, NCR, ctrl);
++	macb_readl(bp, NCR);
++	spin_unlock_irqrestore(&bp->lock, flags);
++
++	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC)) {
++		/* macb_tx_complete() (under tx_ptr_lock) and
++		 * macb_tx_error_task() (under bp->lock) only reopen the TX
++		 * queues while TE is set. Taking both locks once, which
++		 * macb_tx_drop_all_pending() does, waits for one that still
++		 * saw TE set, so once netif_tx_disable() below has stopped the
++		 * queues nothing reopens them before macb_mac_link_up().
++		 */
++		macb_tx_drop_all_pending(bp);
++	}
++
++	/* Stop the queues and wait for a macb_start_xmit() in progress (it
++	 * runs under the queue's xmit lock), so none is mid-flight when the
++	 * ring is dropped below.
++	 */
++	netif_tx_disable(ndev);
+ 
+-	netif_tx_stop_all_queues(ndev);
++	/* Frames queued while the link was up (including by an xmit that was
++	 * still running above) would sit in the ring, holding their skbs,
++	 * socket memory and zerocopy completions, until the link comes back,
++	 * and then be lost anyway: free them now.
++	 */
++	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC))
++		macb_tx_drop_all_pending(bp);
+ }
+ 
+ static void macb_mac_link_up(struct phylink_config *config,
+@@ -780,6 +816,16 @@
+ 	unsigned int q;
+ 	u32 ctrl;
+ 
++	/* TE is off, the controller restarts from ring index 0: resync the
++	 * software ring with it. macb_mac_link_down() already emptied it and
++	 * the queues have stayed stopped since, so normally there is nothing
++	 * left; but should anything have been queued meanwhile, free it
++	 * rather than leak it by just zeroing tx_head/tx_tail. Done before
++	 * taking bp->lock, which nests inside tx_ptr_lock.
++	 */
++	if (!(bp->caps & MACB_CAPS_MACB_IS_EMAC))
++		macb_tx_drop_all_pending(bp);
++
+ 	spin_lock_irqsave(&bp->lock, flags);
+ 
+ 	ctrl = macb_or_gem_readl(bp, NCFGR);
+@@ -804,12 +850,9 @@
+ 		if (rx_pause)
+ 			ctrl |= MACB_BIT(PAE);
+ 
+-		for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
+-			queue->tx_head = 0;
+-			queue->tx_tail = 0;
++		for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue)
+ 			queue_writel(queue, IER,
+ 				     bp->rx_intr_mask | MACB_TX_INT_FLAGS | MACB_BIT(HRESP));
+-		}
+ 	}
+ 
+ 	macb_or_gem_writel(bp, NCFGR, ctrl);
+@@ -1089,6 +1132,65 @@
+ 	}
+ }
+ 
++/* Unmap and free every frame still between tx_tail and tx_head (queued, or
++ * sent but not yet reaped by macb_tx_complete()), count them as dropped and
++ * reset the ring indexes. The caller must have stopped the transmitter and
++ * either hold queue->tx_ptr_lock or have quiesced the queue (macb_close()).
++ *
++ * Freeing the skbs matters beyond the memory: until they are released,
++ * socket send buffer accounting and zerocopy (MSG_ZEROCOPY, in-kernel
++ * ubuf_info) completions are held back indefinitely.
++ */
++static void macb_tx_drop_pending(struct macb_queue *queue)
++{
++	struct macb *bp = queue->bp;
++	unsigned int dropped = 0, tail;
++
++	if (queue->tx_skb) {
++		for (tail = queue->tx_tail; tail != queue->tx_head; tail++) {
++			struct macb_tx_skb *tx_skb = macb_tx_skb(queue, tail);
++
++			if (tx_skb->skb)
++				dropped++;
++			/* budget 0: may run with IRQs disabled */
++			macb_tx_unmap(bp, tx_skb, 0);
++		}
++	}
++
++	queue->stats.tx_dropped += dropped;
++	bp->dev->stats.tx_dropped += dropped;
++
++	queue->tx_head = 0;
++	queue->tx_tail = 0;
++}
++
++/* Link change: TE has been cleared, which also resets the controller's
++ * internal TX queue pointer to TBQP (ring index 0), so the frames still in
++ * the ring would never be sent from where they are. Drop them.
++ *
++ * tx_ptr_lock excludes macb_start_xmit() and macb_tx_complete(); bp->lock,
++ * nested inside it in the same order as in macb_start_xmit(), excludes
++ * macb_tx_error_task(), which walks the ring under bp->lock only.
++ *
++ * IRQs are disabled here, so the skbs are not freed inline:
++ * dev_consume_skb_any() queues them for the NET_TX softirq, which runs
++ * their zerocopy completions shortly after.
++ */
++static void macb_tx_drop_all_pending(struct macb *bp)
++{
++	struct macb_queue *queue;
++	unsigned long flags;
++	unsigned int q;
++
++	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
++		spin_lock_irqsave(&queue->tx_ptr_lock, flags);
++		spin_lock(&bp->lock);
++		macb_tx_drop_pending(queue);
++		spin_unlock(&bp->lock);
++		spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
++	}
++}
++
+ static void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_t addr)
+ {
+ #ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+@@ -1236,8 +1338,12 @@
+ 	if (halt_timeout)
+ 		macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TE));
+ 
+-	/* Now we are ready to start transmission again */
+-	netif_tx_start_all_queues(bp->dev);
++	/* Now we are ready to start transmission again; but not during a link
++	 * down (TE off, see macb_mac_link_down()): macb_mac_link_up() wakes
++	 * the queues then.
++	 */
++	if (macb_readl(bp, NCR) & MACB_BIT(TE))
++		netif_tx_start_all_queues(bp->dev);
+ 	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
+ 
+ 	spin_unlock_irqrestore(&bp->lock, flags);
+@@ -1338,9 +1444,15 @@
+ 	}
+ 
+ 	queue->tx_tail = tail;
++	/* Not while TE is off: macb_mac_link_down() has stopped the queues
++	 * and dropped the ring, and a TX poll still running then must not
++	 * reopen them before macb_mac_link_up() (NCR is read under
++	 * tx_ptr_lock, which macb_mac_link_down() takes after clearing TE).
++	 */
+ 	if (__netif_subqueue_stopped(bp->dev, queue_index) &&
+ 	    CIRC_CNT(queue->tx_head, queue->tx_tail,
+-		     bp->tx_ring_size) <= MACB_TX_WAKEUP_THRESH(bp))
++		     bp->tx_ring_size) <= MACB_TX_WAKEUP_THRESH(bp) &&
++	    (macb_readl(bp, NCR) & MACB_BIT(TE)))
+ 		netif_wake_subqueue(bp->dev, queue_index);
+ 	spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
+ 
+@@ -2552,6 +2664,19 @@
+ 	bp->macbgem_ops.mog_free_rx_buffers(bp);
+ 
+ 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
++		/* Free the frames still in flight (macb_close(): NAPI is
++		 * disabled and the controller reset, no locking needed). The
++		 * open/alloc error paths come here with an empty ring.
++		 *
++		 * With BHs disabled the skbs are freed right here (budget 0,
++		 * IRQs on: consume_skb()), so their zerocopy completions and
++		 * frag page unrefs run inside an RCU (BH) read-side section:
++		 * a zerocopy sender's synchronize_net() then also waits for
++		 * them, as for completions from the TX softirq.
++		 */
++		local_bh_disable();
++		macb_tx_drop_pending(queue);
++		local_bh_enable();
+ 		kfree(queue->tx_skb);
+ 		queue->tx_skb = NULL;
+ 		if (queue->tx_ring) {
