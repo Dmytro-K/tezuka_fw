@@ -1,0 +1,550 @@
+From: Dmytro-K <dimattt92@googlemail.com>
+Subject: [PATCH] iio: buffer: add iio_buffer_get_from_file() and block claiming
+
+Let other kernel code (the iqnet zerocopy UDP streamer) take over the
+legacy DMA blocks of an IIO buffer that userspace allocated through an
+open /dev/iio:deviceN file descriptor.
+
+iio_buffer_get_from_file() returns the primary buffer behind such a file,
+with a reference taken. Only files opened through iio_buffer_fileops are
+accepted: f_op is compared before private_data is trusted, so an arbitrary
+user supplied fd is safe. Anonymous IIO_BUFFER_GET_FD_IOCTL buffer fds,
+event-only device files (iio_event_fileops) and anything else get
+-EINVAL. iio_buffer_fileops is static in industrialio-core.c, hence the
+small IIO-core-internal helper iio_chrdev_file_to_buffer() (iio_core.h).
+
+iio_buffer_claim_blocks() / iio_buffer_release_blocks() hand the blocks
+to the in-kernel user and back. While claimed, -EBUSY is returned by:
+- IIO_BLOCK_ALLOC/FREE/QUERY/ENQUEUE/DEQUEUE_IOCTL on that buffer
+  (through the chardev or an anon fd) and IIO_BUFFER_GET_FD_IOCTL for it;
+- writing 0 to its sysfs buffer/enable, whether or not it is enabled
+  (writing 1 is still allowed: the owner enables the buffer after
+  claiming it, so the first DMA block already belongs to it);
+- writing its buffer/length or buffer/watermark (even the current value)
+  and its scan_elements/*_en attributes.
+Claiming fails with -EBUSY if already claimed or if an anon buffer fd is
+open for it.
+
+The sysfs part matters because a second userspace user would otherwise
+tear the stream down: libiio's local_open(), which iiod runs for every
+network client creating an RX buffer, writes buffer/enable=0,
+buffer/length and buffer/watermark before it even opens the chardev. The
+disable aborted the owner's in-flight DMA and the stream stalled for good;
+now that client fails up front with -EBUSY. In-kernel
+iio_update_buffers() callers and device unregistration are not blocked.
+
+Locking: the claim is a new bit in iio_buffer::flags (next to
+IIO_BUSY_BIT_POS), changed and tested under a new per-buffer mutex,
+iio_buffer::claim_lock. info_exist_lock, which serialises the ioctls,
+cannot be used: it lives in iio_dev_opaque and the claim API only gets
+the buffer, and a bare test_and_set_bit() would not wait for a block
+ioctl that already passed its test. iio_buffer_ioctl() therefore holds
+claim_lock (nested inside info_exist_lock) across the whole block
+operation, and the sysfs stores above hold it (nested inside mlock)
+across theirs, so once iio_buffer_claim_blocks() returns no such
+userspace operation is in progress. A blocking DEQUEUE drops claim_lock
+together with info_exist_lock while it sleeps (so claiming never waits
+for data) and re-checks the claim after retaking both. The anon fd busy
+bit is set in iio_device_buffer_getfd() under claim_lock as well, so the
+two cannot both succeed.
+
+Lock order is info_exist_lock -> mlock -> claim_lock (matching the
+existing info_exist_lock -> mlock of iio_update_buffers()). claim_lock is
+innermost: nothing takes mlock or info_exist_lock with it held; the block
+operations run under it only take the buffer implementation's own locks.
+
+This also fixes the existing DEQUEUE sleep path returning on a signal
+with info_exist_lock dropped, which made its callers unlock a mutex they
+no longer held: both locks are now retaken before every return.
+
+The buffer reference only keeps struct iio_buffer alive. The legacy block
+API frees all blocks when the chardev file is released, and the file holds
+the IIO device reference, so a user of the blocks must also keep a
+reference to the file for as long as it uses them.
+---
+ drivers/iio/iio_core.h            |   3 +
+ drivers/iio/industrialio-buffer.c | 248 ++++++++++++++++++++++++++++--
+ drivers/iio/industrialio-core.c   |  29 ++++
+ include/linux/iio/buffer_impl.h   |  26 ++++
+ 4 files changed, 293 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/iio/iio_core.h b/drivers/iio/iio_core.h
+--- a/drivers/iio/iio_core.h
++++ b/drivers/iio/iio_core.h
+@@ -86,6 +86,9 @@ void iio_buffer_wakeup_poll(struct iio_dev *indio_dev);
+ void iio_buffer_free_blocks(struct iio_buffer *buffer);
+ void iio_device_detach_buffers(struct iio_dev *indio_dev);
+ 
++struct file;
++struct iio_buffer *iio_chrdev_file_to_buffer(const struct file *filp);
++
+ #else
+ 
+ #define iio_buffer_poll_addr NULL
+diff --git a/drivers/iio/industrialio-buffer.c b/drivers/iio/industrialio-buffer.c
+--- a/drivers/iio/industrialio-buffer.c
++++ b/drivers/iio/industrialio-buffer.c
+@@ -40,6 +40,27 @@
+ 
+ #define DMABUF_ENQUEUE_TIMEOUT_MS 5000
+ 
++/*
++ * struct iio_buffer::flags bit, next to IIO_BUSY_BIT_POS: the buffer's blocks
++ * are owned by an in-kernel user, see iio_buffer_claim_blocks(). Only changed
++ * and tested with iio_buffer::claim_lock held.
++ *
++ * Lock order: info_exist_lock -> mlock -> claim_lock. claim_lock is innermost:
++ * it is taken inside info_exist_lock by the block ioctls and
++ * IIO_BUFFER_GET_FD_IOCTL, and inside mlock by the sysfs stores that refuse
++ * to reconfigure a claimed buffer. Nothing may take mlock or info_exist_lock
++ * with claim_lock held (iio_buffer_dequeue_block() drops claim_lock before
++ * info_exist_lock and retakes them in order).
++ */
++#define IIO_BUFFER_CLAIMED_BIT_POS 2
++
++static bool iio_buffer_claimed(struct iio_buffer *buffer)
++{
++	lockdep_assert_held(&buffer->claim_lock);
++
++	return test_bit(IIO_BUFFER_CLAIMED_BIT_POS, &buffer->flags);
++}
++
+ MODULE_IMPORT_NS(DMA_BUF);
+ 
+ struct iio_dmabuf_priv {
+@@ -372,6 +393,7 @@ void iio_buffer_init(struct iio_buffer *buffer)
+ 	INIT_LIST_HEAD(&buffer->buffer_list);
+ 	INIT_LIST_HEAD(&buffer->dmabufs);
+ 	mutex_init(&buffer->dmabufs_mutex);
++	mutex_init(&buffer->claim_lock);
+ 	init_waitqueue_head(&buffer->pollq);
+ 	kref_init(&buffer->ref);
+ 	if (!buffer->watermark)
+@@ -635,7 +657,9 @@ static ssize_t iio_scan_el_store(struct device *dev,
+ 		return ret;
+ 
+ 	guard(mutex)(&iio_dev_opaque->mlock);
+-	if (iio_buffer_is_active(buffer))
++	/* the scan mask of a claimed buffer is fixed, see enable_store() */
++	guard(mutex)(&buffer->claim_lock);
++	if (iio_buffer_is_active(buffer) || iio_buffer_claimed(buffer))
+ 		return -EBUSY;
+ 
+ 	ret = iio_channel_mask_query(indio_dev, buffer, this_attr->address);
+@@ -680,7 +704,9 @@ static ssize_t iio_scan_el_ts_store(struct device *dev,
+ 		return ret;
+ 
+ 	guard(mutex)(&iio_dev_opaque->mlock);
+-	if (iio_buffer_is_active(buffer))
++	/* the scan layout of a claimed buffer is fixed, see enable_store() */
++	guard(mutex)(&buffer->claim_lock);
++	if (iio_buffer_is_active(buffer) || iio_buffer_claimed(buffer))
+ 		return -EBUSY;
+ 
+ 	buffer->scan_timestamp = state;
+@@ -767,10 +793,20 @@ static ssize_t length_store(struct device *dev, struct device_attribute *attr,
+ 	if (ret)
+ 		return ret;
+ 
++	guard(mutex)(&iio_dev_opaque->mlock);
++	/*
++	 * A claimed buffer's blocks are in use by an in-kernel user: refuse
++	 * even a write of the current length, so that a userspace buffer user
++	 * (e.g. libiio, which writes buffer/length before opening the chardev)
++	 * fails right away. See enable_store().
++	 */
++	guard(mutex)(&buffer->claim_lock);
++	if (iio_buffer_claimed(buffer))
++		return -EBUSY;
++
+ 	if (val == buffer->length)
+ 		return len;
+ 
+-	guard(mutex)(&iio_dev_opaque->mlock);
+ 	if (iio_buffer_is_active(buffer))
+ 		return -EBUSY;
+ 
+@@ -1428,6 +1464,19 @@ static ssize_t enable_store(struct device *dev, struct device_attribute *attr,
+ 
+ 	guard(mutex)(&iio_dev_opaque->mlock);
+ 
++	/*
++	 * While an in-kernel user owns the blocks (iio_buffer_claim_blocks()),
++	 * disabling would abort its in-flight DMA and stall it for good, so
++	 * refuse it, even when the buffer is not active yet: another userspace
++	 * buffer user (libiio's local_open(), used by iiod, writes
++	 * buffer/enable=0 first) then fails right away. Enabling stays
++	 * allowed: the owner enables the buffer after claiming it. Held across
++	 * the update so that claiming waits for a disable in progress.
++	 */
++	guard(mutex)(&buffer->claim_lock);
++	if (!requested_state && iio_buffer_claimed(buffer))
++		return -EBUSY;
++
+ 	/* Find out if it is in the list */
+ 	inlist = iio_buffer_is_active(buffer);
+ 	/* Already in desired state */
+@@ -1469,6 +1518,10 @@ static ssize_t watermark_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	guard(mutex)(&iio_dev_opaque->mlock);
++	/* see length_store() */
++	guard(mutex)(&buffer->claim_lock);
++	if (iio_buffer_claimed(buffer))
++		return -EBUSY;
+ 
+ 	if (val > buffer->length)
+ 		return -EINVAL;
+@@ -1721,17 +1774,28 @@ static int iio_buffer_dequeue_block(struct iio_dev *indio_dev,
+ 			 * With 5.15, we always reach this point witth the lock
+ 			 * held so that we need to unlock it before going to
+ 			 * sleep so it's still possible to unregister the device.
++			 * The same goes for claim_lock (taken by
++			 * iio_buffer_ioctl()), so that iio_buffer_claim_blocks()
++			 * does not wait for data that may never come; the claim
++			 * is re-checked once both are retaken.
++			 *
++			 * Both locks are retaken on every return path, the
++			 * callers unlock them.
+ 			 */
++			mutex_unlock(&buffer->claim_lock);
+ 			mutex_unlock(&iio_dev_opaque->info_exist_lock);
+ 			ret = wait_event_interruptible(buffer->pollq,
+ 						       iio_buffer_data_available(buffer) ||
+ 						       !indio_dev->info);
++			mutex_lock(&iio_dev_opaque->info_exist_lock);
++			mutex_lock(&buffer->claim_lock);
+ 			if (ret)
+ 				return ret;
+ 
+-			mutex_lock(&iio_dev_opaque->info_exist_lock);
+ 			if (!indio_dev->info)
+ 				return -ENODEV;
++			if (iio_buffer_claimed(buffer))
++				return -EBUSY;
+ 		}
+ 
+ 		ret = buffer->access->dequeue_block(buffer, &block);
+@@ -1796,27 +1860,62 @@ static int iio_buffer_ioctl(struct file *filp, unsigned int cmd, unsigned long a
+ 	bool non_blocking = filp->f_flags & O_NONBLOCK;
+ 	struct iio_dev *indio_dev = ib->indio_dev;
+ 	struct iio_buffer *rb = ib->buffer;
++	int ret;
+ 
+ 	if (!rb || !rb->access)
+ 		return -ENODEV;
+ 
+ 	switch (cmd) {
+ 	case IIO_BLOCK_ALLOC_IOCTL:
+-		return iio_buffer_alloc_blocks(rb, (struct iio_buffer_block_alloc_req __user *)arg);
+ 	case IIO_BLOCK_FREE_IOCTL:
+-		iio_buffer_free_blocks(rb);
+-		return 0;
+ 	case IIO_BLOCK_QUERY_IOCTL:
+-		return iio_buffer_query_block(rb, (struct iio_buffer_block __user *)arg);
+ 	case IIO_BLOCK_ENQUEUE_IOCTL:
+-		return iio_buffer_enqueue_block(rb, (struct iio_buffer_block __user *)arg);
+ 	case IIO_BLOCK_DEQUEUE_IOCTL:
+-		return iio_buffer_dequeue_block(indio_dev, rb,
+-						(struct iio_buffer_block __user *)arg,
+-						non_blocking);
++		break;
+ 	default:
+ 		return IIO_IOCTL_UNHANDLED;
+ 	}
++
++	/*
++	 * Called with info_exist_lock held, from both the /dev/iio:deviceN and
++	 * the anon buffer fd paths. claim_lock is held for the whole block
++	 * operation (iio_buffer_dequeue_block() drops and retakes it around
++	 * its sleep and re-checks the claim), so once iio_buffer_claim_blocks()
++	 * has returned no userspace block operation is still running on @rb.
++	 * The block operations below must not take mlock (lock order, see
++	 * IIO_BUFFER_CLAIMED_BIT_POS); they only take the buffer
++	 * implementation's own locks (iio_dma_buffer_queue::lock).
++	 */
++	mutex_lock(&rb->claim_lock);
++	if (iio_buffer_claimed(rb)) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	switch (cmd) {
++	case IIO_BLOCK_ALLOC_IOCTL:
++		ret = iio_buffer_alloc_blocks(rb, (struct iio_buffer_block_alloc_req __user *)arg);
++		break;
++	case IIO_BLOCK_FREE_IOCTL:
++		iio_buffer_free_blocks(rb);
++		ret = 0;
++		break;
++	case IIO_BLOCK_QUERY_IOCTL:
++		ret = iio_buffer_query_block(rb, (struct iio_buffer_block __user *)arg);
++		break;
++	case IIO_BLOCK_ENQUEUE_IOCTL:
++		ret = iio_buffer_enqueue_block(rb, (struct iio_buffer_block __user *)arg);
++		break;
++	default: /* IIO_BLOCK_DEQUEUE_IOCTL */
++		ret = iio_buffer_dequeue_block(indio_dev, rb,
++					       (struct iio_buffer_block __user *)arg,
++					       non_blocking);
++		break;
++	}
++
++out_unlock:
++	mutex_unlock(&rb->claim_lock);
++	return ret;
+ }
+ 
+ static long iio_buffer_ioctl_wrapper(struct file *filp, unsigned int cmd,
+@@ -2311,10 +2410,21 @@ static long iio_device_buffer_getfd(struct iio_dev *indio_dev, unsigned long arg
+ 
+ 	buffer = iio_dev_opaque->attached_buffers[idx];
+ 
+-	if (test_and_set_bit(IIO_BUSY_BIT_POS, &buffer->flags)) {
++	/*
++	 * A claimed buffer must not get a second, anonymous, file through
++	 * which its blocks could be reached (or freed on release). Checked and
++	 * the busy bit set under claim_lock, so that this and
++	 * iio_buffer_claim_blocks() (which refuses a busy buffer) exclude each
++	 * other.
++	 */
++	mutex_lock(&buffer->claim_lock);
++	if (iio_buffer_claimed(buffer) ||
++	    test_and_set_bit(IIO_BUSY_BIT_POS, &buffer->flags)) {
++		mutex_unlock(&buffer->claim_lock);
+ 		ret = -EBUSY;
+ 		goto error_iio_dev_put;
+ 	}
++	mutex_unlock(&buffer->claim_lock);
+ 
+ 	ib = kzalloc(sizeof(*ib), GFP_KERNEL);
+ 	if (!ib) {
+@@ -2751,6 +2861,7 @@ static void iio_buffer_release(struct kref *ref)
+ {
+ 	struct iio_buffer *buffer = container_of(ref, struct iio_buffer, ref);
+ 
++	mutex_destroy(&buffer->claim_lock);
+ 	mutex_destroy(&buffer->dmabufs_mutex);
+ 	buffer->access->release(buffer);
+ }
+@@ -2781,6 +2892,117 @@ void iio_buffer_put(struct iio_buffer *buffer)
+ }
+ EXPORT_SYMBOL_GPL(iio_buffer_put);
+ 
++/**
++ * iio_buffer_get_from_file() - Get the IIO buffer behind an IIO chardev file
++ * @filp: file to look at; typically resolved from a user supplied fd, so it
++ *	  may be any kind of file
++ *
++ * Only an open IIO character device file (/dev/iio:deviceN, opened through
++ * iio_buffer_fileops) is accepted; the device's primary buffer is returned.
++ * @filp->f_op is compared against iio_buffer_fileops before
++ * @filp->private_data is trusted, so passing an arbitrary file is safe.
++ * Anonymous buffer files from IIO_BUFFER_GET_FD_IOCTL, files of event-only
++ * IIO devices and any other file are rejected.
++ *
++ * The caller must hold a reference to @filp for the duration of the call
++ * (e.g. obtained with fget() or CLASS(fd, ...)). The returned buffer carries
++ * its own reference, drop it with iio_buffer_put().
++ *
++ * Note that the buffer reference only keeps struct iio_buffer alive. The
++ * legacy block API (CONFIG_IIO_DMA_BUF_MMAP_LEGACY) frees all blocks when the
++ * last reference to the chardev file is released, and the file also holds the
++ * IIO device reference, so a user of the blocks must additionally keep a
++ * reference to @filp (get_file()) for as long as it uses them, and should
++ * take ownership of them with iio_buffer_claim_blocks().
++ *
++ * Return: the buffer with a reference taken, or ERR_PTR(-EINVAL) if @filp is
++ * not an IIO character device file or the IIO device has no buffer.
++ */
++struct iio_buffer *iio_buffer_get_from_file(struct file *filp)
++{
++	struct iio_buffer *buffer;
++
++	if (!filp)
++		return ERR_PTR(-EINVAL);
++
++	/* NULL unless filp->f_op == &iio_buffer_fileops */
++	buffer = iio_chrdev_file_to_buffer(filp);
++	if (!buffer)
++		return ERR_PTR(-EINVAL);
++
++	return iio_buffer_get(buffer);
++}
++EXPORT_SYMBOL_GPL(iio_buffer_get_from_file);
++
++/**
++ * iio_buffer_claim_blocks() - Take exclusive in-kernel ownership of the blocks
++ * @buffer: buffer, e.g. from iio_buffer_get_from_file()
++ *
++ * Marks the blocks of @buffer as owned by an in-kernel user, which then drives
++ * them through @buffer->access directly. While claimed, these fail with
++ * -EBUSY:
++ *
++ * - the userspace block ioctls (IIO_BLOCK_ALLOC/FREE/QUERY/ENQUEUE/
++ *   DEQUEUE_IOCTL) on @buffer and IIO_BUFFER_GET_FD_IOCTL for @buffer;
++ * - writing 0 to the buffer's sysfs buffer/enable (even if it is not
++ *   enabled yet): disabling would abort the owner's in-flight DMA. Writing
++ *   1 is still allowed, the owner typically enables the buffer only after
++ *   claiming it;
++ * - writing the buffer's sysfs buffer/length and buffer/watermark (even
++ *   with the current value) and its ``*_en`` attributes in scan_elements.
++ *
++ * So another userspace user of the device (e.g. libiio's local_open() in
++ * iiod, which writes buffer/enable=0, buffer/length and buffer/watermark
++ * before opening the chardev) fails up front instead of tearing the stream
++ * down. In-kernel iio_update_buffers() callers and device unregistration
++ * are not blocked; the owner must cope with the buffer being disabled
++ * under it that way. Other file operations (poll, read, ...) are not
++ * affected.
++ *
++ * The claim is taken under @buffer->claim_lock, which those ioctls and sysfs
++ * stores hold for the whole operation (a blocking IIO_BLOCK_DEQUEUE_IOCTL
++ * drops it while sleeping and re-checks the claim after waking up). So once
++ * this function returns 0, no such userspace operation is running on @buffer
++ * and none can start until iio_buffer_release_blocks(). Lock order:
++ * info_exist_lock -> mlock -> claim_lock (see IIO_BUFFER_CLAIMED_BIT_POS).
++ *
++ * It does not keep the blocks alive: the caller must also hold a reference to
++ * the IIO chardev file (see iio_buffer_get_from_file()). Must be called from
++ * process context (sleeps).
++ *
++ * Return: 0 on success, -EBUSY if @buffer is already claimed or is open
++ * through an anonymous IIO_BUFFER_GET_FD_IOCTL file.
++ */
++int iio_buffer_claim_blocks(struct iio_buffer *buffer)
++{
++	guard(mutex)(&buffer->claim_lock);
++
++	if (test_bit(IIO_BUSY_BIT_POS, &buffer->flags))
++		return -EBUSY;
++
++	if (test_and_set_bit(IIO_BUFFER_CLAIMED_BIT_POS, &buffer->flags))
++		return -EBUSY;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(iio_buffer_claim_blocks);
++
++/**
++ * iio_buffer_release_blocks() - Give the blocks back to userspace
++ * @buffer: buffer previously claimed with iio_buffer_claim_blocks()
++ *
++ * The caller must have stopped using the blocks (no more access->enqueue_block
++ * / dequeue_block / ... calls) before calling this. Sleeps.
++ */
++void iio_buffer_release_blocks(struct iio_buffer *buffer)
++{
++	guard(mutex)(&buffer->claim_lock);
++
++	WARN_ON(!test_and_clear_bit(IIO_BUFFER_CLAIMED_BIT_POS,
++				    &buffer->flags));
++}
++EXPORT_SYMBOL_GPL(iio_buffer_release_blocks);
++
+ /**
+  * iio_device_attach_buffer - Attach a buffer to a IIO device
+  * @indio_dev: The device the buffer should be attached to
+diff --git a/drivers/iio/industrialio-core.c b/drivers/iio/industrialio-core.c
+--- a/drivers/iio/industrialio-core.c
++++ b/drivers/iio/industrialio-core.c
+@@ -1887,6 +1887,35 @@ static const struct file_operations iio_event_fileops = {
+ 	.release = iio_chrdev_release,
+ };
+ 
++#ifdef CONFIG_IIO_BUFFER
++/**
++ * iio_chrdev_file_to_buffer() - buffer behind an open /dev/iio:deviceN file
++ * @filp: any file
++ *
++ * IIO core internal helper for iio_buffer_get_from_file(). private_data is
++ * only trusted once @filp is known to have been opened through
++ * iio_buffer_fileops (i.e. iio_chrdev_open() has run and set it to a
++ * struct iio_dev_buffer_pair). Files of event-only devices
++ * (iio_event_fileops) carry no buffer and are rejected.
++ *
++ * No reference is taken; the caller must hold a reference to @filp.
++ *
++ * Returns: the device's primary buffer, or NULL if @filp is not an IIO
++ * buffer character device file or the device has no buffer.
++ */
++struct iio_buffer *iio_chrdev_file_to_buffer(const struct file *filp)
++{
++	const struct iio_dev_buffer_pair *ib;
++
++	if (filp->f_op != &iio_buffer_fileops)
++		return NULL;
++
++	ib = filp->private_data;
++
++	return ib ? ib->buffer : NULL;
++}
++#endif
++
+ static int iio_check_unique_scan_index(struct iio_dev *indio_dev)
+ {
+ 	int i, j;
+diff --git a/include/linux/iio/buffer_impl.h b/include/linux/iio/buffer_impl.h
+--- a/include/linux/iio/buffer_impl.h
++++ b/include/linux/iio/buffer_impl.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _IIO_BUFFER_GENERIC_IMPL_H_
+ #define _IIO_BUFFER_GENERIC_IMPL_H_
++#include <linux/err.h>
+ #include <linux/sysfs.h>
+ #include <linux/kref.h>
+ 
+@@ -11,6 +12,7 @@
+ 
+ struct dma_buf_attachment;
+ struct dma_fence;
++struct file;
+ struct iio_dev;
+ struct iio_dma_buffer_block;
+ struct iio_buffer;
+@@ -215,6 +217,15 @@ struct iio_buffer {
+ 
+ 	/* @dmabufs_mutex: Protects dmabufs */
+ 	struct mutex dmabufs_mutex;
++
++	/*
++	 * @claim_lock: Serialises iio_buffer_claim_blocks() against the
++	 * userspace block ioctls, IIO_BUFFER_GET_FD_IOCTL and the buffer's
++	 * sysfs enable/length/watermark/scan element stores, which test the
++	 * claim bit in @flags with it held. Innermost lock: taken inside
++	 * info_exist_lock and mlock, never held while taking either.
++	 */
++	struct mutex claim_lock;
+ };
+ 
+ /**
+@@ -237,13 +248,28 @@ void iio_buffer_init(struct iio_buffer *buffer);
+ 
+ struct iio_buffer *iio_buffer_get(struct iio_buffer *buffer);
+ void iio_buffer_put(struct iio_buffer *buffer);
++struct iio_buffer *iio_buffer_get_from_file(struct file *filp);
++int iio_buffer_claim_blocks(struct iio_buffer *buffer);
++void iio_buffer_release_blocks(struct iio_buffer *buffer);
+ 
+ void iio_buffer_signal_dmabuf_done(struct dma_fence *fence, int ret);
+ 
+ #else /* CONFIG_IIO_BUFFER */
+ 
++struct file;
++struct iio_buffer;
++
+ static inline void iio_buffer_get(struct iio_buffer *buffer) {}
+ static inline void iio_buffer_put(struct iio_buffer *buffer) {}
++static inline struct iio_buffer *iio_buffer_get_from_file(struct file *filp)
++{
++	return ERR_PTR(-EINVAL);
++}
++static inline int iio_buffer_claim_blocks(struct iio_buffer *buffer)
++{
++	return -EOPNOTSUPP;
++}
++static inline void iio_buffer_release_blocks(struct iio_buffer *buffer) {}
+ 
+ #endif /* CONFIG_IIO_BUFFER */
+ #endif /* _IIO_BUFFER_GENERIC_IMPL_H_ */

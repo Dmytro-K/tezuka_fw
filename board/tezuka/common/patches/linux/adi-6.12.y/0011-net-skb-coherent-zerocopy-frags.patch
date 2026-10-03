@@ -1,0 +1,218 @@
+From: Dmytro-K <dimattt92@googlemail.com>
+Subject: [PATCH] net: skb: SKBFL_COHERENT_FRAGS for zerocopy from coherent DMA memory
+
+Add SKBFL_COHERENT_FRAGS: set (through ubuf_info->flags, together with
+SKBFL_ZEROCOPY_FRAG) by an in-kernel zerocopy sender whose pages are
+DMA-coherent (dma_alloc_coherent(), uncached on non-coherent ARM) and never
+written through a cached alias, e.g. IIO DMA blocks. Drivers may then map
+the frags with DMA_ATTR_SKIP_CPU_SYNC and avoid the per-byte L1/PL310 clean
+of dma_map_page() on non-coherent systems.
+
+The flag is part of SKBFL_ALL_ZEROCOPY, so skb_zcopy_clear() (called by
+skb_copy_ubufs() when frags are copied into ordinary cached pages, and on
+release) drops it together with the other zerocopy flags. Clones share
+shinfo; skb_zerocopy_clone() (GSO segmentation, pskb_copy, skb_split)
+propagates it through skb_zcopy_set() from the same ubuf_info.
+skb_frags_dma_coherent() additionally requires SKBFL_ZEROCOPY_ENABLE.
+
+Places where an skb carrying the flag gets frags that are not the sender's
+coherent pages clear it:
+- skb_zerocopy_clone(): when nskb already has frags before orig's
+  ubuf_info is attached (in particular right after skb_copy_ubufs(nskb)
+  copied them into cached pages), since skb_zcopy_set() ORs in the
+  ubuf_info flags.
+- skb_segment(): when a frag_list member's linear head is added as a frag.
+- __ip_append_data()/__ip6_append_data(): on a corked tail skb when the
+  current call does not zerocopy from the same msg_ubuf, since copied or
+  spliced data would be added to that skb as ordinary (cached) frags.
+
+macb: map frags of such skbs with dma_map_page_attrs(...,
+DMA_ATTR_SKIP_CPU_SYNC). The linear part is ordinary cached memory and is
+still mapped with dma_map_single(). Unmap is unchanged: unmapping
+DMA_TO_DEVICE does no cache maintenance.
+
+macb: also set NETIF_F_HIGHDMA (fixed feature). Without it, on a
+CONFIG_HIGHMEM kernel illegal_highdma() makes harmonize_features() drop
+NETIF_F_SG for every skb with a highmem frag, and validate_xmit_skb()
+linearizes it (a full copy, and GSO done in software). The DMA API handles
+highmem pages: dma-direct maps page_to_phys(), arch_sync_dma_for_device()
+-> __dma_page_cpu_to_dev() -> dma_cache_maint_page() kmaps highmem pages
+for the L1 clean and outer_clean_range() works on physical addresses.
+GEM on Zynq-7000 is a 32-bit bus master and all RAM is below 4 GiB, so
+the default 32-bit DMA mask covers every page.
+---
+ drivers/net/ethernet/cadence/macb_main.c |   29 +++++++++++++++++++++++++++--
+ include/linux/skbuff.h                   |   22 +++++++++++++++++++++-
+ net/core/skbuff.c                        |   13 +++++++++++++
+ net/ipv4/ip_output.c                     |    7 +++++++
+ net/ipv6/ip6_output.c                    |    7 +++++++
+ 5 files changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -2089,6 +2089,7 @@ static unsigned int macb_tx_map(struct m
+ 	unsigned int f, nr_frags = skb_shinfo(skb)->nr_frags;
+ 	unsigned int eof = 1, mss_mfs = 0;
+ 	u32 ctrl, lso_ctrl = 0, seq_ctrl = 0;
++	bool coherent_frags = skb_frags_dma_coherent(skb);
+ 
+ 	/* LSO */
+ 	if (skb_shinfo(skb)->gso_size != 0) {
+@@ -2142,8 +2143,22 @@ static unsigned int macb_tx_map(struct m
+ 			entry = macb_tx_ring_wrap(bp, tx_head);
+ 			tx_skb = &queue->tx_skb[entry];
+ 
+-			mapping = skb_frag_dma_map(&bp->pdev->dev, frag,
+-						   offset, size, DMA_TO_DEVICE);
++			/* Frags in DMA-coherent memory (zerocopy from a
++			 * dma_alloc_coherent() buffer) have no dirty cache
++			 * lines: skip the L1/L2 clean. The unmap needs no
++			 * change, unmapping DMA_TO_DEVICE does no cache
++			 * maintenance.
++			 */
++			if (coherent_frags)
++				mapping = dma_map_page_attrs(&bp->pdev->dev,
++							     skb_frag_page(frag),
++							     skb_frag_off(frag) + offset,
++							     size, DMA_TO_DEVICE,
++							     DMA_ATTR_SKIP_CPU_SYNC);
++			else
++				mapping = skb_frag_dma_map(&bp->pdev->dev, frag,
++							   offset, size,
++							   DMA_TO_DEVICE);
+ 			if (dma_mapping_error(&bp->pdev->dev, mapping))
+ 				goto dma_error;
+ 
+@@ -4260,6 +4275,16 @@ static int macb_init(struct platform_dev
+ 		dev->hw_features &= ~NETIF_F_SG;
+ 	dev->features = dev->hw_features;
+ 
++	/* The DMA API can map highmem pages (dma-direct takes page_to_phys();
++	 * the cache maintenance kmaps highmem pages), and the DMA mask set up
++	 * in macb_probe() covers all RAM on the platforms this matters for
++	 * (32-bit Zynq-7000 with CONFIG_HIGHMEM: GEM is a 32-bit bus master,
++	 * RAM is below 4 GiB). Without this, illegal_highdma() makes the core
++	 * drop NETIF_F_SG for any skb with a highmem frag and linearize it.
++	 * A fixed feature: not in hw_features, so it cannot be toggled.
++	 */
++	dev->features |= NETIF_F_HIGHDMA;
++
+ 	/* Check RX Flow Filters support.
+ 	 * Max Rx flows set by availability of screeners & compare regs:
+ 	 * each 4-tuple define requires 1 T2 screener reg + 3 compare regs
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -519,11 +519,23 @@ enum {
+ 	 * use frags only up until ubuf_info is released
+ 	 */
+ 	SKBFL_MANAGED_FRAG_REFS = BIT(4),
++
++	/* all frags point to DMA-coherent (uncached) memory that is never
++	 * written through a cached alias; drivers may map them with
++	 * DMA_ATTR_SKIP_CPU_SYNC. Only meaningful together with
++	 * SKBFL_ZEROCOPY_ENABLE: it must be set only through
++	 * ubuf_info->flags by the owner of those pages, and it is cleared
++	 * with the other zerocopy flags (SKBFL_ALL_ZEROCOPY) whenever the
++	 * frags are copied into ordinary pages (skb_copy_ubufs()) or the
++	 * ubuf_info is released (skb_zcopy_clear()).
++	 */
++	SKBFL_COHERENT_FRAGS = BIT(5),
+ };
+ 
+ #define SKBFL_ZEROCOPY_FRAG	(SKBFL_ZEROCOPY_ENABLE | SKBFL_SHARED_FRAG)
+ #define SKBFL_ALL_ZEROCOPY	(SKBFL_ZEROCOPY_FRAG | SKBFL_PURE_ZEROCOPY | \
+-				 SKBFL_DONT_ORPHAN | SKBFL_MANAGED_FRAG_REFS)
++				 SKBFL_DONT_ORPHAN | SKBFL_MANAGED_FRAG_REFS | \
++				 SKBFL_COHERENT_FRAGS)
+ 
+ struct ubuf_info_ops {
+ 	void (*complete)(struct sk_buff *, struct ubuf_info *,
+@@ -1776,6 +1788,14 @@ static inline bool skb_zcopy_managed(con
+ 	return skb_shinfo(skb)->flags & SKBFL_MANAGED_FRAG_REFS;
+ }
+ 
++/* All page frags of @skb are DMA-coherent, see SKBFL_COHERENT_FRAGS */
++static inline bool skb_frags_dma_coherent(const struct sk_buff *skb)
++{
++	const u8 mask = SKBFL_ZEROCOPY_ENABLE | SKBFL_COHERENT_FRAGS;
++
++	return (skb_shinfo(skb)->flags & mask) == mask;
++}
++
+ static inline bool skb_pure_zcopy_same(const struct sk_buff *skb1,
+ 				       const struct sk_buff *skb2)
+ {
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1922,6 +1922,8 @@ EXPORT_SYMBOL_GPL(__skb_zcopy_downgrade_
+ static int skb_zerocopy_clone(struct sk_buff *nskb, struct sk_buff *orig,
+ 			      gfp_t gfp_mask)
+ {
++	unsigned int frags_before;
++
+ 	if (skb_zcopy(orig)) {
+ 		if (skb_zcopy(nskb)) {
+ 			/* !gfp_mask callers are verified to !skb_zcopy(nskb) */
+@@ -1934,7 +1936,15 @@ static int skb_zerocopy_clone(struct sk_
+ 			if (skb_copy_ubufs(nskb, GFP_ATOMIC))
+ 				return -EIO;
+ 		}
++		/* Frags nskb already has (e.g. just copied into ordinary
++		 * cached pages by skb_copy_ubufs() above) are not orig's
++		 * DMA-coherent pages, but skb_zcopy_set() ORs in orig's
++		 * ubuf_info flags, SKBFL_COHERENT_FRAGS included.
++		 */
++		frags_before = skb_shinfo(nskb)->nr_frags;
+ 		skb_zcopy_set(nskb, skb_uarg(orig), NULL);
++		if (frags_before)
++			skb_shinfo(nskb)->flags &= ~SKBFL_COHERENT_FRAGS;
+ 	}
+ 	return 0;
+ }
+@@ -4942,6 +4952,9 @@ normal:
+ 			}
+ 
+ 			*nskb_frag = (i < 0) ? skb_head_frag_to_page_desc(frag_skb) : *frag;
++			/* a frag_list skb's head is ordinary (cached) memory */
++			if (i < 0)
++				skb_shinfo(nskb)->flags &= ~SKBFL_COHERENT_FRAGS;
+ 			__skb_frag_ref(nskb_frag);
+ 			size = skb_frag_size(nskb_frag);
+ 
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1052,6 +1052,13 @@ static int __ip_append_data(struct sock
+ 			flags &= ~MSG_SPLICE_PAGES;
+ 	}
+ 
++	/* Unless this call zerocopies from the msg_ubuf already attached to
++	 * the corked tail skb, data appended to that skb below (copied into
++	 * page frags, spliced, ...) is not DMA-coherent memory.
++	 */
++	if (skb && !zc)
++		skb_shinfo(skb)->flags &= ~SKBFL_COHERENT_FRAGS;
++
+ 	cork->length += length;
+ 
+ 	hold_tskey = cork->tx_flags & SKBTX_ANY_TSTAMP &&
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1545,6 +1545,13 @@ emsgsize:
+ 			flags &= ~MSG_SPLICE_PAGES;
+ 	}
+ 
++	/* Unless this call zerocopies from the msg_ubuf already attached to
++	 * the corked tail skb, data appended to that skb below (copied into
++	 * page frags, spliced, ...) is not DMA-coherent memory.
++	 */
++	if (skb && !zc)
++		skb_shinfo(skb)->flags &= ~SKBFL_COHERENT_FRAGS;
++
+ 	hold_tskey = cork->tx_flags & SKBTX_ANY_TSTAMP &&
+ 		     READ_ONCE(sk->sk_tsflags) & SOF_TIMESTAMPING_OPT_ID;
+ 	if (hold_tskey)
