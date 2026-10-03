@@ -32,6 +32,9 @@ create_system_files () {
 	ETH_GW=$(fw_printenv -n gateway_eth 2> /dev/null | tr -cd '[a-zA-Z0-9]._-')
 	sha1=$(echo "${SERIAL}" | sha1sum)
 	ETH_MAC=$(printf '00:60:88'; echo "$sha1" | dd bs=1 count=6 2>/dev/null | hexdump -v -e '/1 ":%01c""%c"')
+	# Optional fixed eth0 MAC from U-Boot env (fw_setenv ethaddr_eth xx:xx:xx:xx:xx:xx)
+	ETH_MAC_ENV=$(fw_printenv -n ethaddr_eth 2> /dev/null | tr -cd '0-9a-fA-F:')
+	echo "$ETH_MAC_ENV" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' && ETH_MAC=$ETH_MAC_ENV
 
 	WLAN_SSID=`fw_printenv -n ssid_wlan 2> /dev/null | tr -cd '\040-\176'`
 	WLAN_PWD=`fw_printenv -n pwd_wlan 2> /dev/null | tr -cd '\040-\176'`
