@@ -57,10 +57,49 @@ struct iqnet_stats {
 	__u32 running;         /* 1 while a stream is active */
 };
 
+/*
+ * IQNET_IOC_PL_START: stream the IIO buffer through the PL streamer.
+ *
+ * Same preconditions as IQNET_IOC_START (scan elements selected, blocks
+ * allocated and enqueued, buffer not yet enabled). The module claims the
+ * buffer, resolves the next-hop MAC, programs the streamer and arms it;
+ * userspace then writes buffer/enable=1. No block ever completes: the
+ * streamer keeps the DMA input idle while armed.
+ *
+ * Errors: ENODEV no streamer in the bitstream, EAGAIN next-hop MAC not
+ * resolved yet (neighbour probe started, retry), ENETUNREACH no route or
+ * route not via the PL-attached netdev, ENETDOWN link down or not
+ * 1000/full, EINVAL bad payload_len/reserved, EBUSY a stream is active.
+ */
+struct iqnet_pl_start {
+	__s32 buffer_fd;   /* fd of the opened /dev/iio:deviceN */
+	__u32 dst_addr;    /* IPv4 destination, network byte order */
+	__u16 dst_port;    /* UDP destination port, network byte order */
+	__u16 payload_len; /* multiple of 24, 24..IQNET_MAX_PAYLOAD */
+	__u32 flags;       /* must be zero */
+	__u32 reserved[4]; /* must be zero */
+};
+
+#define IQNET_PATH_NONE   0
+#define IQNET_PATH_KERNEL 1
+#define IQNET_PATH_PL     2
+
+/* IQNET_IOC_STATS plus the fields of the PL streamer path. */
+struct iqnet_stats2 {
+	struct iqnet_stats base;
+	__u32 path;            /* IQNET_PATH_NONE / _KERNEL / _PL */
+	__u32 pl_present;      /* 1 if the loaded bitstream has the streamer */
+	__u64 linux_frames;    /* GEM frames passed through the streamer */
+	__u64 linux_drops;     /* GEM frames dropped by the streamer; nonzero is a defect */
+	__u64 fifo_hwm_bytes;  /* peak fill of the streamer data FIFO since START */
+};
+
 #define IQNET_IOC_MAGIC 'q'
 #define IQNET_IOC_START _IOW(IQNET_IOC_MAGIC, 1, struct iqnet_start)
 /* stop streaming; returns only after every in-flight block is back in IIO */
 #define IQNET_IOC_STOP  _IO(IQNET_IOC_MAGIC, 2)
 #define IQNET_IOC_STATS _IOR(IQNET_IOC_MAGIC, 3, struct iqnet_stats)
+#define IQNET_IOC_PL_START _IOW(IQNET_IOC_MAGIC, 4, struct iqnet_pl_start)
+#define IQNET_IOC_STATS2 _IOR(IQNET_IOC_MAGIC, 5, struct iqnet_stats2)
 
 #endif /* _UAPI_IQNET_H */
