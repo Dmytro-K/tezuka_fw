@@ -10,3 +10,12 @@ u_uac2.h
 board/tezuka/common/uboot-env.config
 Dashboard/node_modules/
 Dashboard/vendor/
+
+.qtc_clangd/
+.qtcreator/
+tezuka_fw.cflags
+tezuka_fw.config
+tezuka_fw.creator
+tezuka_fw.cxxflags
+tezuka_fw.files
+tezuka_fw.includes
