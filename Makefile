@@ -55,11 +55,16 @@ SSH_PASSWORD_ONLY := -o PubkeyAuthentication=no \
 # make does not expand ~, and zsh does not expand it after KEY= either
 KEY_FILE = $(patsubst ~/%,$(HOME)/%,$(KEY))
 
-# Runs on the board (busybox sh) with the key file on stdin. No single
-# quotes inside: the whole script is passed to ssh in single quotes.
+# The key travels base64-encoded in the command line, not on stdin: with
+# stdin redirected and DISPLAY set, ssh asks SSH_ASKPASS for the password
+# instead of the terminal, and the login silently fails.
+KEY_B64 = $(shell base64 -w0 < "$(KEY_FILE)" 2>/dev/null)
+
+# Runs on the board (busybox sh). No single quotes inside: the whole script
+# is passed to ssh in single quotes.
 define SSH_KEY_REMOTE
 umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys || exit 1; \
-while IFS= read -r k || [ -n "$$k" ]; do \
+printf "%s" "$(KEY_B64)" | base64 -d | while IFS= read -r k || [ -n "$$k" ]; do \
 	case "$$k" in "" | "#"*) continue ;; esac; \
 	if grep -qxF "$$k" ~/.ssh/authorized_keys; then \
 		echo "already present: $${k##* }"; \
@@ -103,4 +108,4 @@ endif
 	@test -f "$(KEY_FILE)" || { echo "$(KEY_FILE): no such file"; exit 1; }
 	@! grep -q "PRIVATE KEY" "$(KEY_FILE)" || { echo "$(KEY_FILE) is a private key, pass the .pub file"; exit 1; }
 	@grep -qE '^(ssh-|ecdsa-|sk-)' "$(KEY_FILE)" || { echo "$(KEY_FILE) does not look like an OpenSSH public key"; exit 1; }
-	ssh $(SSH_PASSWORD_ONLY) $(SSH_TARGET) '$(SSH_KEY_REMOTE)' < "$(KEY_FILE)"
+	ssh $(SSH_PASSWORD_ONLY) $(SSH_TARGET) '$(SSH_KEY_REMOTE)'
