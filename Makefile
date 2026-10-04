@@ -7,8 +7,17 @@
 # Optional variables:
 #   BOARD   board output to take images from (default plutoskyr2)
 #   FILES   files from output/$(BOARD)/images/sdimg to copy
-#           (default: kernel, rootfs and devicetree; BOOT.bin and the
-#           bitstream are left alone so an overclocked BOOT.bin survives)
+#           (default: kernel, rootfs and devicetree; BOOT.bin is left alone
+#           so an overclocked BOOT.bin survives)
+#   BITSTREAMS  bitstreams from output/$(BOARD)/images/sdimg to copy
+#           (default system_top.bin tezuka_top.bin; empty = none)
+#   EXTRA_BITSTREAMS  bitstreams built elsewhere, copied under their own
+#           name (default: the PL streamer ../build/hdl/iqnet/iqnet_top.bin
+#           of plutosdr-learn, if it has been built)
+#   BITSTREAM  also select this file as bitstream_image in /boot/uEnv.txt
+#           (U-Boot loads it on the next boot); unset = keep the current
+#           choice. A broken bitstream also takes the network down (the PHY
+#           is behind the PL): roll back from the SD card in a PC.
 #   COPY    rsync (default) or scp. rsync needs rsync on the board too,
 #           which images built before it was added to the defconfig do not
 #           have: flash such a board once with COPY=scp.
@@ -25,11 +34,16 @@
 
 BOARD ?= plutoskyr2
 FILES ?= uImage uramdisk.image.xz devicetree.dtb
+BITSTREAMS ?= system_top.bin tezuka_top.bin
+EXTRA_BITSTREAMS ?= $(wildcard ../build/hdl/iqnet/iqnet_top.bin)
+BITSTREAM ?=
 COPY ?= rsync
 SSH_USER ?= root
 REBOOT ?= 1
 
 SDIMG := output/$(BOARD)/images/sdimg
+COPY_FILES = $(addprefix $(SDIMG)/,$(FILES) $(BITSTREAMS)) $(EXTRA_BITSTREAMS)
+COPY_NAMES = $(notdir $(COPY_FILES))
 SSH_TARGET = $(SSH_USER)@$(IP)
 
 # /boot is FAT: no owners, permissions or symlinks, and timestamps have a
@@ -91,10 +105,17 @@ flash:
 ifndef IP
 	$(error IP is not set: make flash IP=<board address>)
 endif
-	@for f in $(FILES); do \
-		test -f "$(SDIMG)/$$f" || { echo "missing $(SDIMG)/$$f (run ./build.sh $(BOARD))"; exit 1; }; \
+	@for f in $(COPY_FILES); do \
+		test -f "$$f" || { echo "missing $$f (run ./build.sh $(BOARD) or build the bitstream)"; exit 1; }; \
 	done
-	$(COPY_CMD) $(addprefix $(SDIMG)/,$(FILES)) $(SSH_TARGET):/boot/
+ifneq ($(BITSTREAM),)
+	@case " $(COPY_NAMES) " in *" $(BITSTREAM) "*) ;; \
+		*) echo "BITSTREAM=$(BITSTREAM) is not among the copied files: $(COPY_NAMES)"; exit 1 ;; esac
+endif
+	$(COPY_CMD) $(COPY_FILES) $(SSH_TARGET):/boot/
+ifneq ($(BITSTREAM),)
+	ssh $(SSH_TARGET) 'sed -i "s/^bitstream_image=.*/bitstream_image=$(BITSTREAM)/" /boot/uEnv.txt && grep "^bitstream_image=" /boot/uEnv.txt'
+endif
 ifeq ($(REBOOT),1)
 	ssh $(SSH_TARGET) 'sync && reboot'
 else
