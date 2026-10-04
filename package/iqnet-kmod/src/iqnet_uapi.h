@@ -69,7 +69,9 @@ struct iqnet_stats {
  * Errors: ENODEV no streamer in the bitstream, EAGAIN next-hop MAC not
  * resolved yet (neighbour probe started, retry), ENETUNREACH no route or
  * route not via the PL-attached netdev, ENETDOWN link down or not
- * 1000/full, EINVAL bad payload_len/reserved, EBUSY a stream is active.
+ * 1000/full, EINVAL bad payload_len/reserved, EBUSY a stream is active,
+ * EIO the streamer did not arm within 10 ms (ADC or GMII clock not
+ * running).
  */
 struct iqnet_pl_start {
 	__s32 buffer_fd;   /* fd of the opened /dev/iio:deviceN */

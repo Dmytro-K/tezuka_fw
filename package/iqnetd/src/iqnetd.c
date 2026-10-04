@@ -576,6 +576,10 @@ static int stream_pl_start(struct stream *s, char *err, size_t errlen)
         case ENOTTY:
             snprintf(err, errlen, "iqnet module without IQNET_IOC_PL_START (too old?)");
             break;
+        case EIO:
+            /* ADC or GMII clock not running, see dmesg */
+            snprintf(err, errlen, "PL streamer did not arm");
+            break;
         default:
             snprintf(err, errlen, "IQNET_IOC_PL_START: %s", strerror(e));
             break;
