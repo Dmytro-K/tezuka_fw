@@ -14,6 +14,14 @@
 #           have: flash such a board once with COPY=scp.
 #   SSH_USER  ssh user (default root)
 #   REBOOT  0 = copy and sync only, no reboot (default 1)
+#
+#   make ssh-key IP=10.10.11.20 KEY=~/.ssh/id_ed25519.pub
+#       append the public key(s) in KEY to ~/.ssh/authorized_keys on the
+#       board (skipping keys already there) and, for root, save them to
+#       /mnt/jffs2 with device_persistent_keys so S21misc restores them
+#       after every reboot and reflash. Always logs in with the password:
+#       the key is not on the board yet, and offering many agent keys hits
+#       dropbear's MaxAuthTries.
 
 BOARD ?= plutoskyr2
 FILES ?= uImage uramdisk.image.xz devicetree.dtb
@@ -41,7 +49,35 @@ else
 $(error COPY must be rsync or scp, not '$(COPY)')
 endif
 
-.PHONY: flash
+SSH_PASSWORD_ONLY := -o PubkeyAuthentication=no \
+	-o PreferredAuthentications=password,keyboard-interactive
+
+# make does not expand ~, and zsh does not expand it after KEY= either
+KEY_FILE = $(patsubst ~/%,$(HOME)/%,$(KEY))
+
+# Runs on the board (busybox sh) with the key file on stdin. No single
+# quotes inside: the whole script is passed to ssh in single quotes.
+define SSH_KEY_REMOTE
+umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys || exit 1; \
+while IFS= read -r k || [ -n "$$k" ]; do \
+	case "$$k" in "" | "#"*) continue ;; esac; \
+	if grep -qxF "$$k" ~/.ssh/authorized_keys; then \
+		echo "already present: $${k##* }"; \
+	else \
+		printf "%s\n" "$$k" >> ~/.ssh/authorized_keys && echo "added: $${k##* }"; \
+	fi; \
+done; \
+chmod 600 ~/.ssh/authorized_keys; \
+if [ "$$(id -u)" != 0 ]; then \
+	echo "not root: key kept in ~/.ssh only (lost on reboot)"; \
+elif grep -q mtd2 /proc/mounts; then \
+	device_persistent_keys && echo "saved to /mnt/jffs2 (restored on every boot)"; \
+else \
+	echo "warning: /mnt/jffs2 is not mounted, the key is lost on reboot (see device_format_jffs2)"; \
+fi
+endef
+
+.PHONY: flash ssh-key
 
 flash:
 ifndef IP
@@ -56,3 +92,15 @@ ifeq ($(REBOOT),1)
 else
 	ssh $(SSH_TARGET) 'sync'
 endif
+
+ssh-key:
+ifndef IP
+	$(error IP is not set: make ssh-key IP=<board address> KEY=<public key file>)
+endif
+ifndef KEY
+	$(error KEY is not set: make ssh-key IP=<board address> KEY=<public key file>)
+endif
+	@test -f "$(KEY_FILE)" || { echo "$(KEY_FILE): no such file"; exit 1; }
+	@! grep -q "PRIVATE KEY" "$(KEY_FILE)" || { echo "$(KEY_FILE) is a private key, pass the .pub file"; exit 1; }
+	@grep -qE '^(ssh-|ecdsa-|sk-)' "$(KEY_FILE)" || { echo "$(KEY_FILE) does not look like an OpenSSH public key"; exit 1; }
+	ssh $(SSH_PASSWORD_ONLY) $(SSH_TARGET) '$(SSH_KEY_REMOTE)' < "$(KEY_FILE)"
