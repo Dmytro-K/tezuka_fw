@@ -49,7 +49,10 @@ else
 $(error COPY must be rsync or scp, not '$(COPY)')
 endif
 
+# Command-line -o wins over ~/.ssh/config, so a Host entry with
+# "PasswordAuthentication no" (common once a key is set up) does not block it.
 SSH_PASSWORD_ONLY := -o PubkeyAuthentication=no \
+	-o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes \
 	-o PreferredAuthentications=password,keyboard-interactive
 
 # make does not expand ~, and zsh does not expand it after KEY= either
