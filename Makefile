@@ -58,7 +58,7 @@ KEY_FILE = $(patsubst ~/%,$(HOME)/%,$(KEY))
 # The key travels base64-encoded in the command line, not on stdin: with
 # stdin redirected and DISPLAY set, ssh asks SSH_ASKPASS for the password
 # instead of the terminal, and the login silently fails.
-KEY_B64 = $(shell base64 -w0 < "$(KEY_FILE)" 2>/dev/null)
+KEY_B64 = $(shell { base64 -w0 < "$(KEY_FILE)"; } 2>/dev/null)
 
 # Runs on the board (busybox sh). No single quotes inside: the whole script
 # is passed to ssh in single quotes.
