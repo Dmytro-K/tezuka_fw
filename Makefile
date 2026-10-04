@@ -18,6 +18,8 @@ SSH_USER ?= root
 REBOOT ?= 1
 
 SDIMG := output/$(BOARD)/images/sdimg
+# scp -O: the board runs dropbear without sftp-server, and OpenSSH >= 9.0
+# scp uses the SFTP protocol unless told otherwise.
 SSH_TARGET = $(SSH_USER)@$(IP)
 
 .PHONY: flash
@@ -29,7 +31,7 @@ endif
 	@for f in $(FILES); do \
 		test -f "$(SDIMG)/$$f" || { echo "missing $(SDIMG)/$$f (run ./build.sh $(BOARD))"; exit 1; }; \
 	done
-	scp $(addprefix $(SDIMG)/,$(FILES)) $(SSH_TARGET):/boot/
+	scp -O $(addprefix $(SDIMG)/,$(FILES)) $(SSH_TARGET):/boot/
 ifeq ($(REBOOT),1)
 	ssh $(SSH_TARGET) 'sync && reboot'
 else
